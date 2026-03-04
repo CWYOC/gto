@@ -1,45 +1,53 @@
+# gen_all_8max_cash_limp_math.py
+# Generates "math-leaning" (pot-odds + rake) 8-max cash preflop charts WITH limps (SB).
+#
+# Output folder:
+#   charts_matrix_8max_all_cash_limp_math/
+#
+# Use with your updated gto.py trainer:
+#   python gen_all_8max_cash_limp_math.py
+#   python gto.py --dir charts_matrix_8max_all_cash_limp_math
+#
+# Notes:
+# - RFI_* spots: CALL = LIMP (so actions are RAISE/LIMP/FOLD)
+# - VS_*_OPEN_* spots: RAISE = 3BET
+# - RFI_*_VS_3BET_* spots: RAISE = 4BET
+#
+# This is NOT solver GTO, but it is more "real-world math-shaped" than the earlier heuristic:
+# - Calls use pot odds + rake penalty
+# - Strength uses Chen-style score -> equity proxy
+# - 3bet/4bet are value + blocker bluffs with position-based targets
+
 import csv
 from pathlib import Path
 from typing import Tuple
 
 # ----------------------------
-# Config
+# Game config (edit to match your game)
+# ----------------------------
+POSITIONS = ["UTG", "UTG1", "LJ", "HJ", "CO", "BTN", "SB", "BB"]
+POS_I = {p: i for i, p in enumerate(POSITIONS)}
+
+OPEN_SIZE_BB = 2.5
+THREEBET_SIZE_IP = 7.5
+THREEBET_SIZE_OOP = 9.0
+FOURBET_SIZE = 22.0  # not directly used for pot-odds here, but kept for future extension
+
+RAKE_PCT = 0.05
+RAKE_CAP_BB = 0.1
+
+SB_LIMP_ENABLED = True
+
+# ----------------------------
+# Chart output
 # ----------------------------
 CHART_RANKS = "AKQJT98765432"
 IDX = {r: i for i, r in enumerate(CHART_RANKS)}  # A=0 ... 2=12
 
-POSITIONS_8MAX = ["UTG", "UTG1", "LJ", "HJ", "CO", "BTN", "SB", "BB"]
-POS_I = {p: i for i, p in enumerate(POSITIONS_8MAX)}
-
-# Limp policy knobs (cash)
-# - SB limping is the main realistic limp node in cash.
-# - If you want *only* SB limps, set BTN_LIMP_ENABLED = False, CO_LIMP_ENABLED = False
-SB_LIMP_ENABLED = True
-BTN_LIMP_ENABLED = False
-CO_LIMP_ENABLED = False
-
-# ----------------------------
-# Helpers: hand label in matrix
-# ----------------------------
-def hand_label(r_row: str, r_col: str) -> str:
-    """13x13 chart convention:
-       diagonal -> pair (AA)
-       above diagonal -> suited (AKs)
-       below diagonal -> offsuit (AKo)
-    """
-    if r_row == r_col:
-        return r_row + r_col
-    row_i = IDX[r_row]
-    col_i = IDX[r_col]
-    if row_i < col_i:  # above diagonal
-        return f"{r_row}{r_col}s"
-    else:  # below diagonal
-        hi = r_col if IDX[r_col] < IDX[r_row] else r_row
-        lo = r_row if hi == r_col else r_col
-        return f"{hi}{lo}o"
 
 def clamp01(x: float) -> float:
     return max(0.0, min(1.0, x))
+
 
 def fmt_cell(r: float, c: float, f: float) -> str:
     s = r + c + f
@@ -49,202 +57,267 @@ def fmt_cell(r: float, c: float, f: float) -> str:
     r, c, f = r / s, c / s, f / s
     return f"R{round(r*100)}/C{round(c*100)}/F{round(f*100)}"
 
-def rank_strength(r: str) -> float:
-    # A=1.0 ... 2~0.0
-    return 1.0 - (IDX[r] / 12.0)
+
+def hand_label(r_row: str, r_col: str) -> str:
+    """Matrix convention: diagonal pairs, above suited, below offsuit."""
+    if r_row == r_col:
+        return r_row + r_col
+    row_i = IDX[r_row]
+    col_i = IDX[r_col]
+    if row_i < col_i:
+        return f"{r_row}{r_col}s"
+    hi = r_col if IDX[r_col] < IDX[r_row] else r_row
+    lo = r_row if hi == r_col else r_col
+    return f"{hi}{lo}o"
+
+
+def rake_taken(pot_bb: float) -> float:
+    return min(pot_bb * RAKE_PCT, RAKE_CAP_BB)
+
 
 # ----------------------------
-# Base hand scoring (0..1-ish)
+# Hand strength: Chen-ish
 # ----------------------------
-def score_pair(r: str) -> float:
-    s = rank_strength(r)
-    return clamp01(0.55 + 0.45 * s)
+CHEN_BASE = {
+    "A": 10, "K": 8, "Q": 7, "J": 6, "T": 5,
+    "9": 4.5, "8": 4, "7": 3.5, "6": 3, "5": 2.5, "4": 2, "3": 1.5, "2": 1
+}
 
-def score_suited(hi: str, lo: str) -> float:
-    hi_s = rank_strength(hi)
-    lo_s = rank_strength(lo)
-    gap = abs(IDX[lo] - IDX[hi])  # 1=connector
-    base = 0.35 * hi_s + 0.25 * lo_s
 
-    if hi == "A":
-        base += 0.25
-    if hi in "AKQJT" and lo in "AKQJT":
-        base += 0.15
-
-    if gap == 1:
-        base += 0.20
-    elif gap == 2:
-        base += 0.12
-    elif gap == 3:
-        base += 0.06
-
-    return clamp01(base)
-
-def score_offsuit(hi: str, lo: str) -> float:
-    hi_s = rank_strength(hi)
-    lo_s = rank_strength(lo)
-    gap = abs(IDX[lo] - IDX[hi])
-    base = 0.30 * hi_s + 0.18 * lo_s
-
-    if hi == "A":
-        base += 0.16
-    if hi in "AKQJT" and lo in "AKQJT":
-        base += 0.10
-
-    base -= 0.05 * max(0, gap - 2)
-    return clamp01(base)
-
-def hand_score(lbl: str) -> float:
+def chen_score(lbl: str) -> float:
     if len(lbl) == 2:
-        return score_pair(lbl[0])
+        r = lbl[0]
+        base = CHEN_BASE[r]
+        score = base * 2
+        if r in "AKQJT":
+            score += 2
+        elif r in "987":
+            score += 1
+        return max(score, 5.0)
+
     hi, lo, t = lbl[0], lbl[1], lbl[2]
-    return score_suited(hi, lo) if t == "s" else score_offsuit(hi, lo)
+    base = max(CHEN_BASE[hi], CHEN_BASE[lo])
+
+    if t == "s":
+        base += 2
+
+    gap = abs(IDX[lo] - IDX[hi])
+    if gap == 1:
+        base += 1
+    elif gap == 2:
+        base -= 1
+    elif gap == 3:
+        base -= 2
+    elif gap >= 4:
+        base -= 4
+
+    # small suited connector bonus
+    if t == "s" and hi in "98765" and gap <= 2:
+        base += 0.5
+
+    return max(0.0, base)
+
+
+def score_to_equity(score: float) -> float:
+    """
+    Map Chen-ish score to a rough equity proxy (NOT exact).
+    Returns ~0.25..0.70
+    """
+    x = (score - 8.0) / 4.5
+    eq = 0.45 + 0.18 * (x / (1 + abs(x)))
+    return clamp01(eq)
+
+
+def blockers(lbl: str) -> float:
+    if len(lbl) == 2:
+        return 0.2
+    hi, lo = lbl[0], lbl[1]
+    w = 0.0
+    if hi == "A" or lo == "A":
+        w += 1.0
+    if hi == "K" or lo == "K":
+        w += 0.6
+    if hi == "Q" or lo == "Q":
+        w += 0.3
+    return w
+
+
+def playability(lbl: str) -> float:
+    if len(lbl) == 2:
+        return 0.6
+    hi, lo, t = lbl[0], lbl[1], lbl[2]
+    gap = abs(IDX[lo] - IDX[hi])
+    p = 0.0
+    if t == "s":
+        p += 0.6
+    if gap == 1:
+        p += 0.6
+    elif gap == 2:
+        p += 0.35
+    elif gap == 3:
+        p += 0.15
+    if hi in "AKQJT" and lo in "AKQJT":
+        p += 0.25
+    return p
+
 
 # ----------------------------
-# Positional looseness (RFI)
+# Pot odds
 # ----------------------------
-def rfi_looseness(pos: str) -> float:
-    return {
-        "UTG": 0.05,
-        "UTG1": 0.12,
-        "LJ": 0.22,
-        "HJ": 0.35,
-        "CO": 0.55,
-        "BTN": 0.80,
-        "SB": 0.75,  # SB can be quite loose (but may limp)
-    }.get(pos, 0.0)
+def required_equity_call(call_bb: float, pot_before_call_bb: float) -> float:
+    pot_after = pot_before_call_bb + call_bb
+    req = call_bb / max(1e-9, pot_after)
+    # rake penalty
+    req += rake_taken(pot_after) / max(1e-9, pot_after)
+    return clamp01(req)
 
-def rfi_threshold(loose: float) -> float:
-    return clamp01(0.80 - 0.45 * loose)
 
-def band_mix(score: float, thr: float, width: float = 0.10) -> float:
-    m = score - thr
-    if m >= width:
-        return 1.0
-    if m <= -width:
-        return 0.0
-    return clamp01((m + width) / (2 * width))
+def is_in_position(hero: str, villain: str) -> bool:
+    return POS_I[hero] > POS_I[villain]
+
+
+def target_3bet_pct(hero: str, opener: str) -> float:
+    base = {
+        "UTG": 0.03, "UTG1": 0.04, "LJ": 0.05, "HJ": 0.06,
+        "CO": 0.08, "BTN": 0.11, "SB": 0.10, "BB": 0.07
+    }.get(hero, 0.06)
+    base += 0.03 * (POS_I[opener] / (len(POSITIONS) - 1))
+    return clamp01(base)
+
+
+def target_4bet_pct(opener: str, threebettor: str) -> float:
+    base = 0.03
+    if opener in ("CO", "BTN") and threebettor in ("SB", "BB"):
+        base += 0.01
+    return clamp01(base)
+
 
 # ----------------------------
-# RFI with LIMP (CALL=limp in RFI spots)
+# Spot strategies
 # ----------------------------
-def limp_tendency(pos: str, lbl: str) -> float:
+def freqs_rfi(lbl: str, pos: str) -> Tuple[float, float, float]:
     """
-    Returns a 0..1 "limp preference" value used only in RFI spots.
-
-    Cash heuristics:
-      - SB is the primary limp seat (SB completion/limp strategy exists).
-      - Limp prefers: suited hands, connectors/gappers, weaker offsuit that don't want to bloat pot.
-      - Strong hands should mostly raise (limp rarely).
+    RFI: (raise, limp, fold) encoded as (R, C, F)
     """
-    s = hand_score(lbl)
+    s = chen_score(lbl)
+    eq = score_to_equity(s)
 
-    if pos == "SB" and SB_LIMP_ENABLED:
-        base = 0.0
+    loose = {"UTG": 0.05, "UTG1": 0.10, "LJ": 0.18, "HJ": 0.28, "CO": 0.45, "BTN": 0.62, "SB": 0.58}.get(pos, 0.0)
 
-        # suited / connected hands like to limp sometimes
-        if len(lbl) == 3 and lbl[2] == "s":
-            base += 0.35
-            hi, lo = lbl[0], lbl[1]
-            gap = abs(IDX[lo] - IDX[hi])
-            if gap <= 2:
-                base += 0.20
+    # Open threshold in equity space, loosen late
+    thr = 0.49 - 0.09 * loose
 
-        # small pairs can mix limp
-        if len(lbl) == 2 and lbl[0] in "23456789":
-            base += 0.25
-
-        # weak offsuit broadway is usually raise/fold, not limp-heavy
-        if len(lbl) == 3 and lbl[2] == "o":
-            base -= 0.10
-
-        # very strong hands limp less
-        base *= (1.0 - 0.9 * s)
-
-        return clamp01(base)
-
-    if pos == "BTN" and BTN_LIMP_ENABLED:
-        # optional: tiny BTN limp strategy
-        base = 0.12
-        base *= (1.0 - 0.95 * s)
-        return clamp01(base)
-
-    if pos == "CO" and CO_LIMP_ENABLED:
-        base = 0.05
-        base *= (1.0 - 0.95 * s)
-        return clamp01(base)
-
-    return 0.0
-
-def freqs_rfi_cash_with_limp(lbl: str, pos: str) -> Tuple[float, float, float]:
-    """
-    RFI spot outputs:
-      RAISE / LIMP / FOLD  -> encoded as (RAISE, CALL, FOLD) for the trainer.
-    """
-    s = hand_score(lbl)
-    loose = rfi_looseness(pos)
-    thr = rfi_threshold(loose)
-
-    # total VPIP (raise or limp) decision
-    vpip = band_mix(s + 0.20 * loose, thr, width=0.11)
-
-    if vpip <= 0:
+    # Mix within band
+    open_frac = clamp01((eq - (thr - 0.05)) / 0.10)
+    if open_frac <= 0:
         return (0.0, 0.0, 1.0)
 
-    # split vpip into limp vs raise (mainly SB)
-    limp_pref = limp_tendency(pos, lbl)  # 0..1
-    # scale: at most ~55% of your vpip becomes limp for SB fringe hands
-    limp_share = clamp01(0.55 * limp_pref)
+    limp = 0.0
+    if pos == "SB" and SB_LIMP_ENABLED:
+        p = playability(lbl)
+        b = blockers(lbl)
+        limp_pref = clamp01(0.55 * p - 0.25 * b)
+        # avoid limping very strong hands
+        limp_pref *= clamp01(1.0 - 1.4 * max(0.0, eq - 0.55))
+        limp_share = clamp01(0.55 * limp_pref)
+        limp = open_frac * limp_share
 
-    limp = vpip * limp_share
-    raise_ = vpip - limp
-    fold = 1.0 - vpip
+    raise_ = open_frac - limp
+    fold = 1.0 - open_frac
     return (raise_, limp, fold)
 
-# ----------------------------
-# VS OPEN (RAISE=3bet, CALL=call)
-# ----------------------------
-def pressure_factor(hero: str, opener: str) -> float:
-    dist = POS_I[hero] - POS_I[opener]
-    return clamp01(0.15 + 0.12 * dist)
 
 def freqs_vs_open(lbl: str, hero: str, opener: str) -> Tuple[float, float, float]:
-    s = hand_score(lbl)
-    pf = pressure_factor(hero, opener)
+    """
+    vs open: (3bet, call, fold) encoded as (R, C, F)
+    """
+    s = chen_score(lbl)
+    eq = score_to_equity(s)
 
-    opener_tight = 1.0 - rfi_looseness(opener)
-    base_thr = 0.72 - 0.18 * pf + 0.10 * opener_tight
-    cont = band_mix(s + 0.10 * pf, base_thr, width=0.12)
+    ip = is_in_position(hero, opener)
 
-    three_thr = 0.80 - 0.20 * pf
-    three_share = band_mix(s, three_thr, width=0.15)
+    # Pot before hero acts: blinds 1.5 + opener size
+    pot0 = 1.5 + OPEN_SIZE_BB
+    call_cost = OPEN_SIZE_BB
+    req_call = required_equity_call(call_cost, pot0)
 
-    three = cont * three_share
-    call = cont * (1.0 - three_share)
+    # Realization adjustment
+    realization = 1.04 if ip else 0.95
+    eq_eff = clamp01(eq * realization)
+
+    # Call mixing band around required equity
+    call_frac = clamp01((eq_eff - (req_call - 0.03)) / 0.08)
+
+    # 3bet value + bluff using blockers, scaled to a target 3bet%
+    tgt = target_3bet_pct(hero, opener)
+
+    value_thr = 0.58 if ip else 0.60
+    value = clamp01((eq - (value_thr - 0.03)) / 0.06)
+
+    b = blockers(lbl)
+    p = playability(lbl)
+    bluff_seed = clamp01(0.55 * b + 0.15 * p - 0.55 * eq)
+    bluff = bluff_seed * 0.35
+
+    three_raw = clamp01(0.75 * value + 0.25 * bluff)
+    three_frac = clamp01(three_raw * (tgt / 0.10))
+
+    # Cap total continue and avoid double-counting
+    cont = call_frac + three_frac
+    if cont > 1.0:
+        scale = 1.0 / cont
+        call_frac *= scale
+        three_frac *= scale
+        cont = 1.0
+
     fold = 1.0 - cont
-    return (three, call, fold)
+    return (three_frac, call_frac, fold)
 
-# ----------------------------
-# VS 3BET (RAISE=4bet, CALL=call)
-# ----------------------------
+
 def freqs_vs_3bet(lbl: str, opener: str, threebettor: str) -> Tuple[float, float, float]:
-    s = hand_score(lbl)
-    dist = POS_I[threebettor] - POS_I[opener]
-    aggressor_pressure = clamp01(0.20 + 0.10 * dist)
+    """
+    vs 3bet: (4bet, call, fold) encoded as (R, C, F)
+    """
+    s = chen_score(lbl)
+    eq = score_to_equity(s)
 
-    cont_thr = 0.86 + 0.06 * aggressor_pressure
-    cont = band_mix(s, cont_thr, width=0.10)
+    ip = is_in_position(opener, threebettor)  # opener has position if opener is later seat vs blinds etc.
+    size3 = THREEBET_SIZE_IP if ip else THREEBET_SIZE_OOP
 
-    four_thr = 0.95
-    four_share = band_mix(s, four_thr, width=0.06)
+    pot0 = 1.5 + OPEN_SIZE_BB + size3
+    call_cost = max(0.0, size3 - OPEN_SIZE_BB)
+    req_call = required_equity_call(call_cost, pot0)
 
-    four = cont * four_share
-    call = cont * (1.0 - four_share)
+    realization = 1.02 if ip else 0.93
+    eq_eff = clamp01(eq * realization)
+
+    call_frac = clamp01((eq_eff - (req_call - 0.03)) / 0.08)
+
+    tgt4 = target_4bet_pct(opener, threebettor)
+
+    value_thr = 0.64
+    value = clamp01((eq - (value_thr - 0.02)) / 0.05)
+
+    b = blockers(lbl)
+    bluff_seed = clamp01(0.70 * b - 0.85 * eq + 0.10 * playability(lbl))
+    bluff = bluff_seed * (0.20 + (0.08 if threebettor in ("SB", "BB") else 0.0))
+
+    four_raw = clamp01(0.85 * value + 0.15 * bluff)
+    four_frac = clamp01(four_raw * (tgt4 / 0.04))
+
+    cont = call_frac + four_frac
+    if cont > 1.0:
+        scale = 1.0 / cont
+        call_frac *= scale
+        four_frac *= scale
+        cont = 1.0
+
     fold = 1.0 - cont
-    return (four, call, fold)
+    return (four_frac, call_frac, fold)
+
 
 # ----------------------------
-# Writers
+# Writer
 # ----------------------------
 def write_matrix(spot: str, out_dir: Path, cell_func) -> Path:
     out_path = out_dir / f"{spot}_matrix.csv"
@@ -260,77 +333,61 @@ def write_matrix(spot: str, out_dir: Path, cell_func) -> Path:
             w.writerow(row)
     return out_path
 
+
 def main():
-    out_dir = Path("charts_matrix_8max_all_cash_limp")
+    out_dir = Path("charts_matrix_8max_all_cash_limp_math")
     out_dir.mkdir(parents=True, exist_ok=True)
 
     written = 0
 
-    # 1) RFI spots (exclude BB)
-    for pos in POSITIONS_8MAX:
+    # 1) RFI (exclude BB)
+    for pos in POSITIONS:
         if pos == "BB":
             continue
         spot = f"RFI_{pos}"
-        p = write_matrix(
-            spot,
-            out_dir,
-            cell_func=lambda lbl, pos=pos: freqs_rfi_cash_with_limp(lbl, pos)
-        )
-        print(f"Wrote {p.name}")
+        write_matrix(spot, out_dir, cell_func=lambda lbl, pos=pos: freqs_rfi(lbl, pos))
         written += 1
 
-    # 2) VS OPEN spots: all hero positions behind opener
-    for opener in POSITIONS_8MAX:
+    # 2) VS OPEN
+    for opener in POSITIONS:
         if opener == "BB":
             continue
-        for hero in POSITIONS_8MAX:
+        for hero in POSITIONS:
             if POS_I[hero] <= POS_I[opener]:
                 continue
             spot = f"VS_{opener}_OPEN_{hero}"
-            p = write_matrix(
-                spot,
-                out_dir,
-                cell_func=lambda lbl, hero=hero, opener=opener: freqs_vs_open(lbl, hero, opener)
-            )
-            print(f"Wrote {p.name}")
+            write_matrix(spot, out_dir, cell_func=lambda lbl, hero=hero, opener=opener: freqs_vs_open(lbl, hero, opener))
             written += 1
 
-    # 3) VS 3BET spots: opener vs any position behind that 3bets
-    for opener in POSITIONS_8MAX:
+    # 3) VS 3BET after opening
+    for opener in POSITIONS:
         if opener == "BB":
             continue
-        for threebettor in POSITIONS_8MAX:
+        for threebettor in POSITIONS:
             if POS_I[threebettor] <= POS_I[opener]:
                 continue
             spot = f"RFI_{opener}_VS_3BET_{threebettor}"
-            p = write_matrix(
-                spot,
-                out_dir,
-                cell_func=lambda lbl, opener=opener, threebettor=threebettor: freqs_vs_3bet(lbl, opener, threebettor)
-            )
-            print(f"Wrote {p.name}")
+            write_matrix(spot, out_dir, cell_func=lambda lbl, opener=opener, threebettor=threebettor: freqs_vs_3bet(lbl, opener, threebettor))
             written += 1
 
-    # README (important: how to interpret CALL in RFI spots)
-    readme = out_dir / "README.txt"
-    readme.write_text(
-        "charts_matrix_8max_all_cash_limp\n"
-        "Auto-generated baseline preflop matrices for 8-max cash, including limp frequencies.\n\n"
-        "Spot naming:\n"
-        "  RFI_<POS>                     -> open-raise first in (RAISE/LIMP/FOLD)\n"
-        "  VS_<OPENER>_OPEN_<HERO>       -> HERO faces OPENER open (RAISE=3bet, CALL=call, FOLD=fold)\n"
-        "  RFI_<OPENER>_VS_3BET_<POS>    -> OPENER faces 3bet (RAISE=4bet, CALL=call, FOLD=fold)\n\n"
-        "IMPORTANT FOR YOUR TRAINER:\n"
-        "  In RFI spots, the generator encodes LIMP as CALL.\n"
-        "  So: RAISE=open-raise, CALL=limp, FOLD=fold.\n\n"
-        "Cell format:\n"
-        "  AKs:R70/C30/F0\n\n"
-        "Note: This is NOT solver-GTO. It's a heuristic baseline for training.\n",
+    (out_dir / "README.txt").write_text(
+        "Math-leaning baseline charts (NOT solver-GTO)\n\n"
+        "Key ideas used:\n"
+        "- Chen-style hand strength -> rough equity proxy\n"
+        "- Calls use pot-odds + rake penalty\n"
+        "- 3bet and 4bet are value + blocker bluffs, with target frequencies by position\n"
+        "- RFI spots include SB limps (CALL in RFI = LIMP)\n\n"
+        "Spot interpretation for your trainer:\n"
+        "  RFI_*               -> RAISE / LIMP / FOLD  (LIMP stored as CALL)\n"
+        "  VS_*_OPEN_*         -> 3BET / CALL / FOLD   (3BET stored as RAISE)\n"
+        "  RFI_*_VS_3BET_*     -> 4BET / CALL / FOLD   (4BET stored as RAISE)\n",
         encoding="utf-8"
     )
 
-    print(f"\nDone. Wrote {written} matrix files into: {out_dir.resolve()}")
-    print("Use them by running your trainer inside this folder, or copy *.csv next to gto_trainer_8max.py.")
+    print(f"Done. Wrote {written} matrices to: {out_dir.resolve()}")
+    print("Run trainer with:")
+    print("  python gto.py --dir charts_matrix_8max_all_cash_limp_math")
+
 
 if __name__ == "__main__":
     main()
