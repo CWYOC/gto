@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Poker Preflop Trainer (8-max cash)</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header class="wrap">
+    <h1>Poker Preflop Trainer</h1>
+    <p class="sub">8-max cash • realtime “math-ish” ranges • limp-aware (SB)</p>
+  </header>
+
+  <main class="wrap grid">
+    <section class="card">
+      <h2>Mode</h2>
+      <div class="row">
+        <label>Mode</label>
+        <select id="mode">
+          <option value="practice">Practice</option>
+          <option value="chart">Chart</option>
+        </select>
+      </div>
+
+      <div class="row">
+        <label>Spot</label>
+        <select id="spot"></select>
+      </div>
+
+      <div class="row">
+        <label>Hand</label>
+        <input id="hand" value="AKs" maxlength="3" />
+        <button id="randHand">Random hand</button>
+      </div>
+
+      <div class="row">
+        <label>Lock spot</label>
+        <input id="lockSpot" type="checkbox" />
+      </div>
+
+      <div class="row">
+        <button id="randSpot">Random spot</button>
+        <button id="nextQ">Next (practice)</button>
+      </div>
+
+      <hr/>
+
+      <h2>Variables</h2>
+      <div class="vars">
+        <div class="row"><label>Open size (bb)</label><input id="openSize" type="number" step="0.1" value="2.5"></div>
+        <div class="row"><label>3bet IP (bb)</label><input id="threeIP" type="number" step="0.5" value="7.5"></div>
+        <div class="row"><label>3bet OOP (bb)</label><input id="threeOOP" type="number" step="0.5" value="9.0"></div>
+        <div class="row"><label>Rake %</label><input id="rakePct" type="number" step="0.5" value="5.0"></div>
+        <div class="row"><label>Rake cap (bb)</label><input id="rakeCap" type="number" step="0.1" value="1.0"></div>
+
+        <div class="row"><label>Call req discount</label><input id="reqDisc" type="number" step="0.5" value="0.0"></div>
+
+        <div class="row"><label>Realize IP vs open</label><input id="rIPo" type="number" step="0.01" value="1.04"></div>
+        <div class="row"><label>Realize OOP vs open</label><input id="rOOPo" type="number" step="0.01" value="0.95"></div>
+
+        <div class="row"><label>Realize IP vs 3bet</label><input id="rIP3" type="number" step="0.01" value="1.02"></div>
+        <div class="row"><label>Realize OOP vs 3bet</label><input id="rOOP3" type="number" step="0.01" value="0.93"></div>
+
+        <div class="row">
+          <label>Enable SB limps</label>
+          <input id="sbLimp" type="checkbox" checked>
+        </div>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2 id="panelTitle">Practice</h2>
+
+      <div id="practicePanel">
+        <div class="big" id="prompt"></div>
+        <div class="mono" id="mix"></div>
+
+        <div class="btnRow">
+          <button class="act" id="a1"></button>
+          <button class="act" id="a2"></button>
+          <button class="act" id="a3"></button>
+        </div>
+
+        <div id="result" class="result"></div>
+        <div id="score" class="mono">Score: 0/0</div>
+      </div>
+
+      <div id="chartPanel" class="hidden">
+        <div class="row">
+          <label>Cell display</label>
+          <select id="cellMode">
+            <option value="raise">Raise%</option>
+            <option value="call">Call%</option>
+            <option value="fold">Fold%</option>
+            <option value="all">All</option>
+          </select>
+        </div>
+
+        <div class="chartWrap">
+          <div id="chart"></div>
+        </div>
+        <p class="sub">Tip: click a cell to set the practice hand.</p>
+      </div>
+    </section>
+  </main>
+
+  <footer class="wrap foot">
+    <span class="mono">Not solver-GTO. “Math-ish” baseline: pot odds + rake penalty + Chen-style strength proxy.</span>
+  </footer>
+
+  <script src="app.js"></script>
+</body>
+</html>
