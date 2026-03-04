@@ -9,7 +9,11 @@ RANKS = "23456789TJQKA"
 RANK_TO_I = {r: i for i, r in enumerate(RANKS)}
 CHART_RANKS = "AKQJT98765432"  # matrix order
 
-ACTIONS = ("RAISE", "CALL", "FOLD")
+# Internal action keys (canonical)
+A_RAISE = "RAISE"
+A_CALL = "CALL"
+A_FOLD = "FOLD"
+ACTIONS_INTERNAL = (A_RAISE, A_CALL, A_FOLD)
 
 
 # -------------------------
@@ -31,10 +35,10 @@ class Hand:
 
 def all_169_labels() -> List[str]:
     labels = []
-    # Pairs first (AA..22)
+    # Pairs AA..22
     for r in reversed(RANKS):
         labels.append(r + r)
-    # Non-pairs hi>lo, suited then offsuit
+    # Non-pairs hi>lo: suited then offsuit
     for i in range(len(RANKS) - 1, -1, -1):
         hi = RANKS[i]
         for j in range(i - 1, -1, -1):
@@ -48,10 +52,7 @@ ALL_169 = all_169_labels()
 
 
 def normalize_hand_label(lbl: str) -> str:
-    """
-    Normalize labels like 'qko' -> 'KQo', 'aqs' -> 'AQs', 'aa' -> 'AA'
-    Returns canonical: pairs 'AA', suited 'AKs', offsuit 'AKo'
-    """
+    """Normalize labels like 'qko' -> 'KQo', 'aqs' -> 'AQs', 'aa' -> 'AA'."""
     lbl = (lbl or "").strip()
     if not lbl:
         raise ValueError("Empty hand label")
@@ -108,7 +109,7 @@ def load_row_csv(path: Path) -> Dict[str, Dict[str, Tuple[float, float, float]]]
 
             s = rf + cf + ff
             if s <= 0:
-                # If you left blank, default to fold=1
+                # default fold if blank
                 rf, cf, ff = 0.0, 0.0, 1.0
                 s = 1.0
 
@@ -125,21 +126,20 @@ CELL_RE = re.compile(r"^\s*([AKQJT98765432]{2}(?:[so])?)\s*:\s*(.*)\s*$", re.IGN
 
 def parse_freq_triplet(cell_payload: str) -> Tuple[float, float, float]:
     """
-    Accepts common cell payload formats, examples:
+    Accepts:
       "R70/C30/F0"
       "R0.7/C0.3/F0"
-      "R__/C__/F__"  -> treated as blanks => fold 1
-      ""             -> fold 1
+      "R70%/C30%/F0%"  (percent signs OK)
+      "" or placeholders -> fold 1
     Returns normalized (r,c,f).
     """
     s = (cell_payload or "").strip()
     if not s or "__" in s:
         return (0.0, 0.0, 1.0)
 
-    # Extract numbers after R, C, F
-    # Allow percentages or decimals.
+    # Extract numbers after R, C, F (allow optional %)
     def find(prefix: str) -> float:
-        m = re.search(rf"{prefix}\s*([0-9]*\.?[0-9]+)", s, re.IGNORECASE)
+        m = re.search(rf"{prefix}\s*([0-9]*\.?[0-9]+)\s*%?", s, re.IGNORECASE)
         return float(m.group(1)) if m else 0.0
 
     r = find("R")
@@ -150,17 +150,11 @@ def parse_freq_triplet(cell_payload: str) -> Tuple[float, float, float]:
     if total <= 0:
         return (0.0, 0.0, 1.0)
 
-    # If user typed 70/30/0 (sum 100), normalization handles it.
     return (r / total, c / total, f / total)
 
 
 def hand_label_from_matrix(r_row: str, r_col: str) -> str:
-    """
-    Same convention as your matrix generator:
-      diagonal -> pair
-      above diagonal -> suited
-      below diagonal -> offsuit
-    """
+    """Infer label from matrix coordinates (diagonal/pair, above/suited, below/offsuit)."""
     if r_row == r_col:
         return r_row + r_col
 
@@ -168,21 +162,18 @@ def hand_label_from_matrix(r_row: str, r_col: str) -> str:
     col_i = CHART_RANKS.index(r_col)
 
     if row_i < col_i:
-        # above diagonal -> suited (row rank first)
         return normalize_hand_label(f"{r_row}{r_col}s")
     else:
-        # below diagonal -> offsuit (higher rank first)
         return normalize_hand_label(f"{r_col}{r_row}o")
 
 
 def load_matrix_csv(path: Path) -> Dict[str, Dict[str, Tuple[float, float, float]]]:
     """
-    Matrix CSV format:
-      First row header: [spot, A, K, Q, ... 2]
-      First col each row: rank letter
-      Each cell: "AKs:R70/C30/F0" or "AKs:R__/C__/F__" etc.
+    Matrix CSV:
+      header: [spot, A, K, ..., 2]
+      each cell: "AKs:R70/C30/F0"
     Returns:
-      chart[spot][hand_label] = (raise, call, fold)
+      chart[spot][hand] = (raise, call, fold)
     """
     with path.open("r", newline="", encoding="utf-8") as f:
         rows = list(csv.reader(f))
@@ -190,20 +181,9 @@ def load_matrix_csv(path: Path) -> Dict[str, Dict[str, Tuple[float, float, float
     if not rows or len(rows[0]) < 2:
         raise ValueError(f"{path.name} doesn't look like a matrix CSV")
 
-    spot = (rows[0][0] or "").strip()
-    if not spot:
-        # fallback: infer from filename
-        spot = path.stem.replace("_matrix", "")
-
-    header_ranks = [c.strip() for c in rows[0][1:]]
-    if "".join(header_ranks) != CHART_RANKS:
-        # Still allow if header ranks are correct set/order
-        # but best to use the generator's default.
-        pass
-
+    spot = (rows[0][0] or "").strip() or path.stem.replace("_matrix", "")
     chart: Dict[str, Dict[str, Tuple[float, float, float]]] = {spot: {}}
 
-    # rows[1:] each starts with row-rank
     for r in rows[1:]:
         if not r:
             continue
@@ -218,30 +198,24 @@ def load_matrix_csv(path: Path) -> Dict[str, Dict[str, Tuple[float, float, float
             r_col = CHART_RANKS[j]
 
             cell_text = (cell or "").strip()
-            # Expected "AKs:payload"
             m = CELL_RE.match(cell_text)
             if m:
-                hand_lbl_raw = m.group(1)
+                hand_lbl = normalize_hand_label(m.group(1))
                 payload = m.group(2)
-                hand_lbl = normalize_hand_label(hand_lbl_raw)
                 freqs = parse_freq_triplet(payload)
             else:
-                # If the cell isn't in "HAND:..." format, infer hand from position
                 hand_lbl = hand_label_from_matrix(r_row, r_col)
                 freqs = parse_freq_triplet(cell_text)
 
             chart[spot][hand_lbl] = freqs
 
-    # Ensure every hand exists; missing defaults to fold
+    # ensure all hands exist (default fold)
     for h in ALL_169:
         chart[spot].setdefault(h, (0.0, 0.0, 1.0))
 
     return chart
 
 
-# -------------------------
-# Merge multiple sources
-# -------------------------
 def merge_charts(*charts: Dict[str, Dict[str, Tuple[float, float, float]]]) -> Dict[str, Dict[str, Tuple[float, float, float]]]:
     out: Dict[str, Dict[str, Tuple[float, float, float]]] = {}
     for ch in charts:
@@ -251,30 +225,7 @@ def merge_charts(*charts: Dict[str, Dict[str, Tuple[float, float, float]]]) -> D
     return out
 
 
-# -------------------------
-# Trainer logic
-# -------------------------
-def sample_action(freqs: Tuple[float, float, float]) -> str:
-    r, c, f = freqs
-    x = random.random()
-    if x < r:
-        return "RAISE"
-    if x < r + c:
-        return "CALL"
-    return "FOLD"
-
-
-def explain(freqs: Tuple[float, float, float]) -> str:
-    r, c, f = freqs
-    return f"Target mix: RAISE {r:.0%} | CALL {c:.0%} | FOLD {f:.0%}"
-
-
 def load_all_from_folder(folder: Path) -> Dict[str, Dict[str, Tuple[float, float, float]]]:
-    """
-    Loads:
-      - charts.csv (row-based) if present
-      - any *_matrix.csv in folder (matrix-based)
-    """
     charts = []
 
     row_file = folder / "charts.csv"
@@ -293,19 +244,82 @@ def load_all_from_folder(folder: Path) -> Dict[str, Dict[str, Tuple[float, float
     return merge_charts(*charts)
 
 
+# -------------------------
+# Spot-aware action labels
+# -------------------------
+def spot_action_aliases(spot: str) -> Tuple[str, str, str]:
+    """
+    Returns display labels for (RAISE, CALL, FOLD) depending on spot type.
+
+    - RFI_*                      : (RAISE, LIMP, FOLD)
+    - VS_*_OPEN_*                : (3BET, CALL, FOLD)
+    - RFI_*_VS_3BET_*            : (4BET, CALL, FOLD)
+    Default                      : (RAISE, CALL, FOLD)
+    """
+    s = spot.upper()
+    if s.startswith("RFI_") and "_VS_3BET_" not in s:
+        return ("RAISE", "LIMP", "FOLD")
+    if "_VS_3BET_" in s:
+        return ("4BET", "CALL", "FOLD")
+    if s.startswith("VS_") and "_OPEN_" in s:
+        return ("3BET", "CALL", "FOLD")
+    return ("RAISE", "CALL", "FOLD")
+
+
+def display_to_internal(spot: str, user_action: str) -> Optional[str]:
+    """Map user displayed action back to internal action key."""
+    user_action = user_action.strip().upper()
+    a_raise, a_call, a_fold = spot_action_aliases(spot)
+    mapping = {
+        a_raise: A_RAISE,
+        a_call: A_CALL,
+        a_fold: A_FOLD,
+        # allow internal words too
+        "RAISE": A_RAISE,
+        "CALL": A_CALL,
+        "FOLD": A_FOLD,
+        "LIMP": A_CALL,
+        "3BET": A_RAISE,
+        "4BET": A_RAISE,
+    }
+    return mapping.get(user_action)
+
+
+def internal_to_display(spot: str, internal_action: str) -> str:
+    a_raise, a_call, a_fold = spot_action_aliases(spot)
+    if internal_action == A_RAISE:
+        return a_raise
+    if internal_action == A_CALL:
+        return a_call
+    return a_fold
+
+
+# -------------------------
+# Trainer core
+# -------------------------
+def sample_action(freqs: Tuple[float, float, float]) -> str:
+    r, c, f = freqs
+    x = random.random()
+    if x < r:
+        return A_RAISE
+    if x < r + c:
+        return A_CALL
+    return A_FOLD
+
+
+def explain(spot: str, freqs: Tuple[float, float, float]) -> str:
+    r, c, f = freqs
+    a_raise, a_call, a_fold = spot_action_aliases(spot)
+    return f"Target mix: {a_raise} {r:.0%} | {a_call} {c:.0%} | {a_fold} {f:.0%}"
+
+
 def main():
-    print("=== GTO Table Trainer (8-max friendly, CSV-driven) ===")
-    print("Loads YOUR tables (row CSV and/or matrix CSV) and quizzes you with mixed-frequency actions.\n")
-    print("Files supported in current folder:")
-    print("  - charts.csv (row format: spot,hand,raise,call,fold)")
-    print("  - *_matrix.csv (13x13 readable grid format)")
-    print("\nCommands:")
-    print("  q            quit")
-    print("  spots        list available spots")
-    print("  spot <name>  lock a spot (e.g., spot RFI_UTG)")
-    print("  unlock       unlock spot (random spot each hand)")
-    print("  show         show frequencies for the current question again")
-    print("  any key      next question\n")
+    print("=== GTO Trainer (8-max cash + limp aware) ===")
+    print("Loads your *_matrix.csv files and quizzes actions with mixed frequencies.")
+    print("Interpretation depends on spot:\n"
+          "  RFI_*               -> RAISE / LIMP / FOLD  (LIMP stored as CALL)\n"
+          "  VS_*_OPEN_*         -> 3BET / CALL / FOLD   (3BET stored as RAISE)\n"
+          "  RFI_*_VS_3BET_*     -> 4BET / CALL / FOLD   (4BET stored as RAISE)\n")
 
     folder = Path(".")
     try:
@@ -317,10 +331,17 @@ def main():
     spots = sorted(chart.keys())
     print(f"Loaded {len(spots)} spot(s). Type 'spots' to list.\n")
 
+    print("Commands:")
+    print("  q            quit")
+    print("  spots        list spots")
+    print("  spot <name>  lock one spot")
+    print("  unlock       random spots")
+    print("  show         show last target mix\n")
+
     locked_spot: Optional[str] = None
     score = 0
     total = 0
-    last_info = None  # (spot, hand, freqs)
+    last_info = None  # (spot, hand, freqs, sampled_internal_action)
 
     while True:
         cmd = input("> ").strip()
@@ -345,38 +366,42 @@ def main():
             continue
         if low == "show":
             if last_info:
-                s, h, freqs = last_info
+                s, h, freqs, sampled = last_info
                 print(f"Spot: {s} | Hand: {h}")
-                print(explain(freqs))
+                print(explain(s, freqs))
+                print(f"(Last sampled action: {internal_to_display(s, sampled)})")
             else:
                 print("No previous question yet.")
             continue
 
-        # Ask a new question
+        # new question
         spot = locked_spot or random.choice(spots)
         hand = random.choice(list(chart[spot].keys()))
         freqs = chart[spot][hand]
-        target = sample_action(freqs)
-        last_info = (spot, hand, freqs)
+        sampled_internal = sample_action(freqs)
 
+        a_raise, a_call, a_fold = spot_action_aliases(spot)
         print(f"\nSpot: {spot}")
         print(f"Hand: {hand}")
-        print("Choose: RAISE / CALL / FOLD")
-        ans = input("action> ").strip().upper()
+        print(f"Choose: {a_raise} / {a_call} / {a_fold}")
+        ans = input("action> ").strip()
 
-        if ans not in ACTIONS:
-            print("Invalid. Use RAISE/CALL/FOLD.")
+        internal = display_to_internal(spot, ans)
+        if internal is None:
+            print("Invalid action for this spot.")
             continue
 
         total += 1
-        if ans == target:
+        if internal == sampled_internal:
             score += 1
             print("✅ Correct (for this mixed-frequency draw).")
         else:
-            print(f"❌ Not this time. The sampled GTO action was: {target}")
+            print(f"❌ Not this time. Sampled action was: {internal_to_display(spot, sampled_internal)}")
 
-        print(explain(freqs))
+        print(explain(spot, freqs))
         print(f"Score: {score}/{total} ({(score/total)*100:.1f}%)")
+
+        last_info = (spot, hand, freqs, sampled_internal)
 
     print(f"\nFinal: {score}/{total} ({(score/total)*100:.1f}%)")
 
