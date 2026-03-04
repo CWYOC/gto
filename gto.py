@@ -1,410 +1,798 @@
-import csv
+"""
+Real-time 8-max cash preflop "math-ish" trainer (NO CSV) + UI (tkinter)
+
+What it does
+- Computes frequencies on-the-fly (R/C/F) for:
+  1) RFI_<POS>                  -> RAISE / LIMP / FOLD  (CALL internally = LIMP)
+  2) VS_<OPENER>_OPEN_<HERO>    -> 3BET / CALL / FOLD   (RAISE internally = 3BET)
+  3) RFI_<OPENER>_VS_3BET_<X>   -> 4BET / CALL / FOLD   (RAISE internally = 4BET)
+- All key variables editable in the UI (open size, 3bet sizes, rake, etc.)
+- Practice mode: random hand + random spot, you answer, it scores you.
+- Chart mode: shows a 13x13 grid for the selected spot; updates live when you change variables.
+
+Important
+- This is NOT solver GTO. It’s a “real-world math-shaped baseline”:
+  pot-odds + rake penalty + rough strength proxy (Chen-ish) + blocker/playability logic.
+"""
+
 import random
 import re
-from pathlib import Path
+import tkinter as tk
+from tkinter import ttk
 from dataclasses import dataclass
-from typing import Dict, Tuple, Optional, List
+from typing import Tuple, Optional, Dict, List
 
-RANKS = "23456789TJQKA"
-RANK_TO_I = {r: i for i, r in enumerate(RANKS)}
-CHART_RANKS = "AKQJT98765432"  # matrix order
+# -----------------------------
+# Constants / helpers
+# -----------------------------
+CHART_RANKS = "AKQJT98765432"
+IDX = {r: i for i, r in enumerate(CHART_RANKS)}  # A=0 ... 2=12
 
-# Internal action keys (canonical)
-A_RAISE = "RAISE"
-A_CALL = "CALL"
-A_FOLD = "FOLD"
-ACTIONS_INTERNAL = (A_RAISE, A_CALL, A_FOLD)
+POSITIONS = ["UTG", "UTG1", "LJ", "HJ", "CO", "BTN", "SB", "BB"]
+POS_I = {p: i for i, p in enumerate(POSITIONS)}
 
+# Chen-ish base
+CHEN_BASE = {
+    "A": 10, "K": 8, "Q": 7, "J": 6, "T": 5,
+    "9": 4.5, "8": 4, "7": 3.5, "6": 3, "5": 2.5, "4": 2, "3": 1.5, "2": 1
+}
 
-# -------------------------
-# Hand + normalization
-# -------------------------
-@dataclass(frozen=True)
-class Hand:
-    r1: str
-    r2: str
-    suited: Optional[bool]  # True suited, False offsuit, None pair
+def clamp01(x: float) -> float:
+    return max(0.0, min(1.0, x))
 
-    def label(self) -> str:
-        a, b = self.r1, self.r2
-        if a == b:
-            return a + a
-        hi, lo = (a, b) if RANK_TO_I[a] > RANK_TO_I[b] else (b, a)
-        return f"{hi}{lo}{'s' if self.suited else 'o'}"
+def fmt_pct(x: float) -> str:
+    return f"{round(x*100):>3d}%"
 
+def normalize_rcf(r: float, c: float, f: float) -> Tuple[float, float, float]:
+    s = r + c + f
+    if s <= 0:
+        return (0.0, 0.0, 1.0)
+    return (r/s, c/s, f/s)
 
-def all_169_labels() -> List[str]:
-    labels = []
-    # Pairs AA..22
-    for r in reversed(RANKS):
-        labels.append(r + r)
-    # Non-pairs hi>lo: suited then offsuit
-    for i in range(len(RANKS) - 1, -1, -1):
-        hi = RANKS[i]
-        for j in range(i - 1, -1, -1):
-            lo = RANKS[j]
-            labels.append(f"{hi}{lo}s")
-            labels.append(f"{hi}{lo}o")
-    return labels
+def cell_hand_label(row_rank: str, col_rank: str) -> str:
+    """Matrix convention: diagonal pairs, above suited, below offsuit."""
+    if row_rank == col_rank:
+        return row_rank + col_rank
+    row_i = IDX[row_rank]
+    col_i = IDX[col_rank]
+    if row_i < col_i:
+        return f"{row_rank}{col_rank}s"
+    # below diagonal: ensure high-low
+    hi = col_rank if IDX[col_rank] < IDX[row_rank] else row_rank
+    lo = row_rank if hi == col_rank else col_rank
+    return f"{hi}{lo}o"
 
-
-ALL_169 = all_169_labels()
-
-
-def normalize_hand_label(lbl: str) -> str:
-    """Normalize labels like 'qko' -> 'KQo', 'aqs' -> 'AQs', 'aa' -> 'AA'."""
-    lbl = (lbl or "").strip()
-    if not lbl:
-        raise ValueError("Empty hand label")
-    lbl = lbl.upper()
-
-    if len(lbl) == 2:
-        if lbl[0] != lbl[1] or lbl[0] not in RANKS:
-            raise ValueError(f"Bad pair label: {lbl}")
+def parse_hand_label(lbl: str) -> str:
+    lbl = lbl.strip().upper()
+    if len(lbl) == 2 and lbl[0] in CHART_RANKS and lbl[1] == lbl[0]:
         return lbl
-
-    if len(lbl) == 3 and lbl[0] in RANKS and lbl[1] in RANKS and lbl[2] in ("S", "O"):
+    if len(lbl) == 3 and lbl[0] in CHART_RANKS and lbl[1] in CHART_RANKS and lbl[2] in ("S", "O"):
         a, b, t = lbl[0], lbl[1], lbl[2].lower()
         if a == b:
             return a + a
-        hi, lo = (a, b) if RANK_TO_I[a] > RANK_TO_I[b] else (b, a)
-        return f"{hi}{lo}{t}"
-
+        # normalize hi/lo
+        if IDX[a] > IDX[b]:  # remember A=0 is "higher", so bigger index means lower rank
+            a, b = b, a
+        # now a is higher in chart-order sense (lower index)
+        return f"{a}{b}{t}"
     raise ValueError(f"Bad hand label: {lbl}")
 
-
-# -------------------------
-# Loading charts (row-based)
-# -------------------------
-def load_row_csv(path: Path) -> Dict[str, Dict[str, Tuple[float, float, float]]]:
-    """
-    Row CSV format:
-      spot,hand,raise,call,fold
-    Returns:
-      chart[spot][hand_label] = (raise, call, fold) normalized
-    """
-    chart: Dict[str, Dict[str, Tuple[float, float, float]]] = {}
-    with path.open("r", newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        required = {"spot", "hand", "raise", "call", "fold"}
-        if not required.issubset(set(reader.fieldnames or [])):
-            raise ValueError(f"{path.name} must have columns: {sorted(required)}")
-
-        for row in reader:
-            spot = (row.get("spot") or "").strip()
-            if not spot:
-                continue
-
-            hand = normalize_hand_label(row.get("hand") or "")
-
-            def to_float(x: str) -> float:
-                x = (x or "").strip()
-                if x == "":
-                    return 0.0
-                return float(x)
-
-            rf = to_float(row.get("raise", "0"))
-            cf = to_float(row.get("call", "0"))
-            ff = to_float(row.get("fold", "0"))
-
-            s = rf + cf + ff
-            if s <= 0:
-                # default fold if blank
-                rf, cf, ff = 0.0, 0.0, 1.0
-                s = 1.0
-
-            rf, cf, ff = rf / s, cf / s, ff / s
-            chart.setdefault(spot, {})[hand] = (rf, cf, ff)
-
-    return chart
-
-
-# -------------------------
-# Loading charts (matrix-based)
-# -------------------------
-CELL_RE = re.compile(r"^\s*([AKQJT98765432]{2}(?:[so])?)\s*:\s*(.*)\s*$", re.IGNORECASE)
-
-def parse_freq_triplet(cell_payload: str) -> Tuple[float, float, float]:
-    """
-    Accepts:
-      "R70/C30/F0"
-      "R0.7/C0.3/F0"
-      "R70%/C30%/F0%"  (percent signs OK)
-      "" or placeholders -> fold 1
-    Returns normalized (r,c,f).
-    """
-    s = (cell_payload or "").strip()
-    if not s or "__" in s:
-        return (0.0, 0.0, 1.0)
-
-    # Extract numbers after R, C, F (allow optional %)
-    def find(prefix: str) -> float:
-        m = re.search(rf"{prefix}\s*([0-9]*\.?[0-9]+)\s*%?", s, re.IGNORECASE)
-        return float(m.group(1)) if m else 0.0
-
-    r = find("R")
-    c = find("C")
-    f = find("F")
-
-    total = r + c + f
-    if total <= 0:
-        return (0.0, 0.0, 1.0)
-
-    return (r / total, c / total, f / total)
-
-
-def hand_label_from_matrix(r_row: str, r_col: str) -> str:
-    """Infer label from matrix coordinates (diagonal/pair, above/suited, below/offsuit)."""
-    if r_row == r_col:
-        return r_row + r_col
-
-    row_i = CHART_RANKS.index(r_row)
-    col_i = CHART_RANKS.index(r_col)
-
-    if row_i < col_i:
-        return normalize_hand_label(f"{r_row}{r_col}s")
-    else:
-        return normalize_hand_label(f"{r_col}{r_row}o")
-
-
-def load_matrix_csv(path: Path) -> Dict[str, Dict[str, Tuple[float, float, float]]]:
-    """
-    Matrix CSV:
-      header: [spot, A, K, ..., 2]
-      each cell: "AKs:R70/C30/F0"
-    Returns:
-      chart[spot][hand] = (raise, call, fold)
-    """
-    with path.open("r", newline="", encoding="utf-8") as f:
-        rows = list(csv.reader(f))
-
-    if not rows or len(rows[0]) < 2:
-        raise ValueError(f"{path.name} doesn't look like a matrix CSV")
-
-    spot = (rows[0][0] or "").strip() or path.stem.replace("_matrix", "")
-    chart: Dict[str, Dict[str, Tuple[float, float, float]]] = {spot: {}}
-
-    for r in rows[1:]:
-        if not r:
-            continue
-        r_row = (r[0] or "").strip()
-        if r_row not in CHART_RANKS:
-            continue
-
-        cells = r[1:]
-        for j, cell in enumerate(cells):
-            if j >= len(CHART_RANKS):
-                break
-            r_col = CHART_RANKS[j]
-
-            cell_text = (cell or "").strip()
-            m = CELL_RE.match(cell_text)
-            if m:
-                hand_lbl = normalize_hand_label(m.group(1))
-                payload = m.group(2)
-                freqs = parse_freq_triplet(payload)
-            else:
-                hand_lbl = hand_label_from_matrix(r_row, r_col)
-                freqs = parse_freq_triplet(cell_text)
-
-            chart[spot][hand_lbl] = freqs
-
-    # ensure all hands exist (default fold)
-    for h in ALL_169:
-        chart[spot].setdefault(h, (0.0, 0.0, 1.0))
-
-    return chart
-
-
-def merge_charts(*charts: Dict[str, Dict[str, Tuple[float, float, float]]]) -> Dict[str, Dict[str, Tuple[float, float, float]]]:
-    out: Dict[str, Dict[str, Tuple[float, float, float]]] = {}
-    for ch in charts:
-        for spot, hands in ch.items():
-            out.setdefault(spot, {})
-            out[spot].update(hands)
+def all_169() -> List[str]:
+    out = []
+    for r in CHART_RANKS:
+        out.append(r+r)
+    for i, hi in enumerate(CHART_RANKS):
+        for lo in CHART_RANKS[i+1:]:
+            out.append(f"{hi}{lo}s")
+            out.append(f"{hi}{lo}o")
     return out
 
+ALL_169 = all_169()
 
-def load_all_from_folder(folder: Path) -> Dict[str, Dict[str, Tuple[float, float, float]]]:
-    charts = []
+# -----------------------------
+# Config (editable in UI)
+# -----------------------------
+@dataclass
+class Config:
+    open_size_bb: float = 2.5
+    threebet_ip: float = 7.5
+    threebet_oop: float = 9.0
+    rake_pct: float = 0.05
+    rake_cap_bb: float = 1.0
 
-    row_file = folder / "charts.csv"
-    if row_file.exists():
-        charts.append(load_row_csv(row_file))
+    # “loosen/tighten” knobs
+    call_req_discount: float = 0.00  # subtract from required equity (e.g. 0.02 to loosen calls)
+    realize_ip_vs_open: float = 1.04
+    realize_oop_vs_open: float = 0.95
+    realize_ip_vs_3bet: float = 1.02
+    realize_oop_vs_3bet: float = 0.93
 
-    for p in sorted(folder.glob("*_matrix.csv")):
-        charts.append(load_matrix_csv(p))
+    # SB limps
+    sb_limp_enabled: bool = True
 
-    if not charts:
-        raise FileNotFoundError(
-            f"No charts found in {folder.resolve()}.\n"
-            f"Put charts.csv or *_matrix.csv files there."
-        )
+    # RFI looseness by position (equity threshold shifts)
+    rfi_loose: Dict[str, float] = None
 
-    return merge_charts(*charts)
+    def __post_init__(self):
+        if self.rfi_loose is None:
+            self.rfi_loose = {
+                "UTG": 0.05, "UTG1": 0.10, "LJ": 0.18, "HJ": 0.28,
+                "CO": 0.45, "BTN": 0.62, "SB": 0.58
+            }
 
+# -----------------------------
+# “Math-ish” model
+# -----------------------------
+def rake_taken(cfg: Config, pot_bb: float) -> float:
+    return min(pot_bb * cfg.rake_pct, cfg.rake_cap_bb)
 
-# -------------------------
-# Spot-aware action labels
-# -------------------------
-def spot_action_aliases(spot: str) -> Tuple[str, str, str]:
-    """
-    Returns display labels for (RAISE, CALL, FOLD) depending on spot type.
+def chen_score(lbl: str) -> float:
+    if len(lbl) == 2:
+        r = lbl[0]
+        base = CHEN_BASE[r]
+        score = base * 2
+        if r in "AKQJT":
+            score += 2
+        elif r in "987":
+            score += 1
+        return max(score, 5.0)
 
-    - RFI_*                      : (RAISE, LIMP, FOLD)
-    - VS_*_OPEN_*                : (3BET, CALL, FOLD)
-    - RFI_*_VS_3BET_*            : (4BET, CALL, FOLD)
-    Default                      : (RAISE, CALL, FOLD)
-    """
+    hi, lo, t = lbl[0], lbl[1], lbl[2]
+    base = max(CHEN_BASE[hi], CHEN_BASE[lo])
+    if t == "s":
+        base += 2
+
+    gap = abs(IDX[lo] - IDX[hi])
+    if gap == 1:
+        base += 1
+    elif gap == 2:
+        base -= 1
+    elif gap == 3:
+        base -= 2
+    elif gap >= 4:
+        base -= 4
+
+    if t == "s" and hi in "98765" and gap <= 2:
+        base += 0.5
+
+    return max(0.0, base)
+
+def score_to_equity(score: float) -> float:
+    x = (score - 8.0) / 4.5
+    eq = 0.45 + 0.18 * (x / (1 + abs(x)))
+    return clamp01(eq)
+
+def blockers(lbl: str) -> float:
+    if len(lbl) == 2:
+        return 0.2
+    hi, lo = lbl[0], lbl[1]
+    w = 0.0
+    if hi == "A" or lo == "A":
+        w += 1.0
+    if hi == "K" or lo == "K":
+        w += 0.6
+    if hi == "Q" or lo == "Q":
+        w += 0.3
+    return w
+
+def playability(lbl: str) -> float:
+    if len(lbl) == 2:
+        return 0.6
+    hi, lo, t = lbl[0], lbl[1], lbl[2]
+    gap = abs(IDX[lo] - IDX[hi])
+    p = 0.0
+    if t == "s":
+        p += 0.6
+    if gap == 1:
+        p += 0.6
+    elif gap == 2:
+        p += 0.35
+    elif gap == 3:
+        p += 0.15
+    if hi in "AKQJT" and lo in "AKQJT":
+        p += 0.25
+    return p
+
+def required_equity_call(cfg: Config, call_bb: float, pot_before_call_bb: float) -> float:
+    pot_after = pot_before_call_bb + call_bb
+    req = call_bb / max(1e-9, pot_after)
+    req += rake_taken(cfg, pot_after) / max(1e-9, pot_after)
+    req -= cfg.call_req_discount
+    return clamp01(req)
+
+def is_in_position(hero: str, villain: str) -> bool:
+    return POS_I[hero] > POS_I[villain]
+
+def target_3bet_pct(hero: str, opener: str) -> float:
+    base = {
+        "UTG": 0.03, "UTG1": 0.04, "LJ": 0.05, "HJ": 0.06,
+        "CO": 0.08, "BTN": 0.11, "SB": 0.10, "BB": 0.07
+    }.get(hero, 0.06)
+    base += 0.03 * (POS_I[opener] / (len(POSITIONS) - 1))
+    return clamp01(base)
+
+def target_4bet_pct(opener: str, threebettor: str) -> float:
+    base = 0.03
+    if opener in ("CO", "BTN") and threebettor in ("SB", "BB"):
+        base += 0.01
+    return clamp01(base)
+
+def freqs_rfi(cfg: Config, hand: str, pos: str) -> Tuple[float, float, float]:
+    """(raise, limp, fold) encoded as (R, C, F)."""
+    s = chen_score(hand)
+    eq = score_to_equity(s)
+
+    loose = cfg.rfi_loose.get(pos, 0.0)
+    thr = 0.49 - 0.09 * loose  # lower threshold late
+
+    open_frac = clamp01((eq - (thr - 0.05)) / 0.10)
+    if open_frac <= 0:
+        return (0.0, 0.0, 1.0)
+
+    limp = 0.0
+    if pos == "SB" and cfg.sb_limp_enabled:
+        p = playability(hand)
+        b = blockers(hand)
+        limp_pref = clamp01(0.55 * p - 0.25 * b)
+        limp_pref *= clamp01(1.0 - 1.4 * max(0.0, eq - 0.55))
+        limp_share = clamp01(0.55 * limp_pref)
+        limp = open_frac * limp_share
+
+    raise_ = open_frac - limp
+    fold = 1.0 - open_frac
+    return normalize_rcf(raise_, limp, fold)
+
+def freqs_vs_open(cfg: Config, hand: str, hero: str, opener: str) -> Tuple[float, float, float]:
+    """(3bet, call, fold) encoded as (R, C, F)."""
+    s = chen_score(hand)
+    eq = score_to_equity(s)
+
+    ip = is_in_position(hero, opener)
+    pot0 = 1.5 + cfg.open_size_bb
+    call_cost = cfg.open_size_bb
+    req_call = required_equity_call(cfg, call_cost, pot0)
+
+    realization = cfg.realize_ip_vs_open if ip else cfg.realize_oop_vs_open
+    eq_eff = clamp01(eq * realization)
+
+    call_frac = clamp01((eq_eff - (req_call - 0.03)) / 0.08)
+
+    tgt = target_3bet_pct(hero, opener)
+    value_thr = 0.58 if ip else 0.60
+    value = clamp01((eq - (value_thr - 0.03)) / 0.06)
+
+    b = blockers(hand)
+    p = playability(hand)
+    bluff_seed = clamp01(0.55 * b + 0.15 * p - 0.55 * eq)
+    bluff = bluff_seed * 0.35
+
+    three_raw = clamp01(0.75 * value + 0.25 * bluff)
+    three_frac = clamp01(three_raw * (tgt / 0.10))
+
+    cont = call_frac + three_frac
+    if cont > 1.0:
+        scale = 1.0 / cont
+        call_frac *= scale
+        three_frac *= scale
+
+    fold = 1.0 - (call_frac + three_frac)
+    return normalize_rcf(three_frac, call_frac, fold)
+
+def freqs_vs_3bet(cfg: Config, hand: str, opener: str, threebettor: str) -> Tuple[float, float, float]:
+    """(4bet, call, fold) encoded as (R, C, F)."""
+    s = chen_score(hand)
+    eq = score_to_equity(s)
+
+    ip = is_in_position(opener, threebettor)
+    size3 = cfg.threebet_ip if ip else cfg.threebet_oop
+
+    pot0 = 1.5 + cfg.open_size_bb + size3
+    call_cost = max(0.0, size3 - cfg.open_size_bb)
+    req_call = required_equity_call(cfg, call_cost, pot0)
+
+    realization = cfg.realize_ip_vs_3bet if ip else cfg.realize_oop_vs_3bet
+    eq_eff = clamp01(eq * realization)
+
+    call_frac = clamp01((eq_eff - (req_call - 0.03)) / 0.08)
+
+    tgt4 = target_4bet_pct(opener, threebettor)
+    value_thr = 0.64
+    value = clamp01((eq - (value_thr - 0.02)) / 0.05)
+
+    b = blockers(hand)
+    bluff_seed = clamp01(0.70 * b - 0.85 * eq + 0.10 * playability(hand))
+    bluff = bluff_seed * (0.20 + (0.08 if threebettor in ("SB", "BB") else 0.0))
+
+    four_raw = clamp01(0.85 * value + 0.15 * bluff)
+    four_frac = clamp01(four_raw * (tgt4 / 0.04))
+
+    cont = call_frac + four_frac
+    if cont > 1.0:
+        scale = 1.0 / cont
+        call_frac *= scale
+        four_frac *= scale
+
+    fold = 1.0 - (call_frac + four_frac)
+    return normalize_rcf(four_frac, call_frac, fold)
+
+# -----------------------------
+# Spot naming + action labels
+# -----------------------------
+def spot_type(spot: str) -> str:
     s = spot.upper()
     if s.startswith("RFI_") and "_VS_3BET_" not in s:
-        return ("RAISE", "LIMP", "FOLD")
+        return "RFI"
     if "_VS_3BET_" in s:
-        return ("4BET", "CALL", "FOLD")
+        return "VS3B"
     if s.startswith("VS_") and "_OPEN_" in s:
+        return "VSOPEN"
+    return "OTHER"
+
+def spot_actions(spot: str) -> Tuple[str, str, str]:
+    t = spot_type(spot)
+    if t == "RFI":
+        return ("RAISE", "LIMP", "FOLD")
+    if t == "VSOPEN":
         return ("3BET", "CALL", "FOLD")
+    if t == "VS3B":
+        return ("4BET", "CALL", "FOLD")
     return ("RAISE", "CALL", "FOLD")
 
+def parse_spot_parts(spot: str) -> Tuple[str, str, Optional[str]]:
+    """
+    Returns (type, a, b)
+    - RFI_POS -> ("RFI", POS, None)
+    - VS_OPENER_OPEN_HERO -> ("VSOPEN", OPENER, HERO)
+    - RFI_OPENER_VS_3BET_THREEBETTOR -> ("VS3B", OPENER, THREEBETTOR)
+    """
+    s = spot.strip()
+    if s.startswith("RFI_") and "_VS_3BET_" not in s:
+        return ("RFI", s.split("_", 1)[1], None)
+    m = re.match(r"^VS_([A-Z0-9]+)_OPEN_([A-Z0-9]+)$", s, re.IGNORECASE)
+    if m:
+        return ("VSOPEN", m.group(1).upper(), m.group(2).upper())
+    m = re.match(r"^RFI_([A-Z0-9]+)_VS_3BET_([A-Z0-9]+)$", s, re.IGNORECASE)
+    if m:
+        return ("VS3B", m.group(1).upper(), m.group(2).upper())
+    raise ValueError(f"Unrecognized spot: {spot}")
 
-def display_to_internal(spot: str, user_action: str) -> Optional[str]:
-    """Map user displayed action back to internal action key."""
-    user_action = user_action.strip().upper()
-    a_raise, a_call, a_fold = spot_action_aliases(spot)
-    mapping = {
-        a_raise: A_RAISE,
-        a_call: A_CALL,
-        a_fold: A_FOLD,
-        # allow internal words too
-        "RAISE": A_RAISE,
-        "CALL": A_CALL,
-        "FOLD": A_FOLD,
-        "LIMP": A_CALL,
-        "3BET": A_RAISE,
-        "4BET": A_RAISE,
-    }
-    return mapping.get(user_action)
+def compute_freqs(cfg: Config, spot: str, hand: str) -> Tuple[float, float, float]:
+    t, a, b = parse_spot_parts(spot)
+    if t == "RFI":
+        return freqs_rfi(cfg, hand, a)
+    if t == "VSOPEN":
+        return freqs_vs_open(cfg, hand, hero=b, opener=a)  # type: ignore
+    if t == "VS3B":
+        return freqs_vs_3bet(cfg, hand, opener=a, threebettor=b)  # type: ignore
+    return (0.0, 0.0, 1.0)
 
-
-def internal_to_display(spot: str, internal_action: str) -> str:
-    a_raise, a_call, a_fold = spot_action_aliases(spot)
-    if internal_action == A_RAISE:
-        return a_raise
-    if internal_action == A_CALL:
-        return a_call
-    return a_fold
-
-
-# -------------------------
-# Trainer core
-# -------------------------
-def sample_action(freqs: Tuple[float, float, float]) -> str:
+def sample_action_from_freqs(freqs: Tuple[float, float, float]) -> str:
     r, c, f = freqs
     x = random.random()
     if x < r:
-        return A_RAISE
+        return "R"
     if x < r + c:
-        return A_CALL
-    return A_FOLD
+        return "C"
+    return "F"
 
+# -----------------------------
+# UI
+# -----------------------------
+class App(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Poker Preflop Trainer (8-max cash, realtime math-ish, limp-aware)")
+        self.geometry("1200x760")
 
-def explain(spot: str, freqs: Tuple[float, float, float]) -> str:
-    r, c, f = freqs
-    a_raise, a_call, a_fold = spot_action_aliases(spot)
-    return f"Target mix: {a_raise} {r:.0%} | {a_call} {c:.0%} | {a_fold} {f:.0%}"
+        self.cfg = Config()
 
+        # State
+        self.mode = tk.StringVar(value="Practice")  # Practice / Chart
+        self.current_spot = tk.StringVar(value="RFI_BTN")
+        self.current_hand = tk.StringVar(value="AKs")
+        self.lock_spot = tk.BooleanVar(value=False)
+        self.score = 0
+        self.total = 0
+        self.last_sampled = None  # ("R"/"C"/"F")
 
-def main():
-    print("=== GTO Trainer (8-max cash + limp aware) ===")
-    print("Loads your *_matrix.csv files and quizzes actions with mixed frequencies.")
-    print("Interpretation depends on spot:\n"
-          "  RFI_*               -> RAISE / LIMP / FOLD  (LIMP stored as CALL)\n"
-          "  VS_*_OPEN_*         -> 3BET / CALL / FOLD   (3BET stored as RAISE)\n"
-          "  RFI_*_VS_3BET_*     -> 4BET / CALL / FOLD   (4BET stored as RAISE)\n")
+        self._build_ui()
+        self._refresh_all()
 
-    folder = Path(".")
-    try:
-        chart = load_all_from_folder(folder)
-    except Exception as e:
-        print(f"Load error: {e}")
-        return
+    # ---------- Build ----------
+    def _build_ui(self):
+        # Top bar
+        top = ttk.Frame(self, padding=8)
+        top.pack(side=tk.TOP, fill=tk.X)
 
-    spots = sorted(chart.keys())
-    print(f"Loaded {len(spots)} spot(s). Type 'spots' to list.\n")
+        ttk.Label(top, text="Mode:").pack(side=tk.LEFT)
+        ttk.OptionMenu(top, self.mode, self.mode.get(), "Practice", "Chart", command=lambda _: self._refresh_all()).pack(side=tk.LEFT, padx=6)
 
-    print("Commands:")
-    print("  q            quit")
-    print("  spots        list spots")
-    print("  spot <name>  lock one spot")
-    print("  unlock       random spots")
-    print("  show         show last target mix\n")
+        ttk.Label(top, text="Spot:").pack(side=tk.LEFT, padx=(14, 2))
+        self.spot_menu = ttk.Combobox(top, textvariable=self.current_spot, width=32, state="readonly")
+        self.spot_menu["values"] = self._all_spots()
+        self.spot_menu.bind("<<ComboboxSelected>>", lambda e: self._refresh_all())
+        self.spot_menu.pack(side=tk.LEFT)
 
-    locked_spot: Optional[str] = None
-    score = 0
-    total = 0
-    last_info = None  # (spot, hand, freqs, sampled_internal_action)
+        ttk.Checkbutton(top, text="Lock spot (Practice)", variable=self.lock_spot).pack(side=tk.LEFT, padx=10)
 
-    while True:
-        cmd = input("> ").strip()
-        low = cmd.lower()
+        ttk.Button(top, text="Random spot", command=self._random_spot).pack(side=tk.LEFT, padx=6)
+        ttk.Button(top, text="Random hand", command=self._random_hand).pack(side=tk.LEFT, padx=6)
 
-        if low == "q":
-            break
-        if low == "spots":
-            print("\n".join(spots))
-            continue
-        if low.startswith("spot "):
-            name = cmd[5:].strip()
-            if name in chart:
-                locked_spot = name
-                print(f"Locked spot: {locked_spot}")
-            else:
-                print("Unknown spot. Type 'spots' to see available.")
-            continue
-        if low == "unlock":
-            locked_spot = None
-            print("Unlocked (random spots).")
-            continue
-        if low == "show":
-            if last_info:
-                s, h, freqs, sampled = last_info
-                print(f"Spot: {s} | Hand: {h}")
-                print(explain(s, freqs))
-                print(f"(Last sampled action: {internal_to_display(s, sampled)})")
-            else:
-                print("No previous question yet.")
-            continue
+        ttk.Separator(self).pack(side=tk.TOP, fill=tk.X, pady=4)
 
-        # new question
-        spot = locked_spot or random.choice(spots)
-        hand = random.choice(list(chart[spot].keys()))
-        freqs = chart[spot][hand]
-        sampled_internal = sample_action(freqs)
+        # Main split
+        main = ttk.Frame(self, padding=8)
+        main.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
 
-        a_raise, a_call, a_fold = spot_action_aliases(spot)
-        print(f"\nSpot: {spot}")
-        print(f"Hand: {hand}")
-        print(f"Choose: {a_raise} / {a_call} / {a_fold}")
-        ans = input("action> ").strip()
+        left = ttk.Frame(main)
+        left.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 10))
 
-        internal = display_to_internal(spot, ans)
-        if internal is None:
-            print("Invalid action for this spot.")
-            continue
+        right = ttk.Frame(main)
+        right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-        total += 1
-        if internal == sampled_internal:
-            score += 1
-            print("✅ Correct (for this mixed-frequency draw).")
+        # Left: Config controls
+        ttk.Label(left, text="Variables (live)", font=("Arial", 12, "bold")).pack(anchor="w", pady=(0, 6))
+
+        self._add_num(left, "Open size (bb)", "open_size_bb", 0.5, 6.0, 0.1)
+        self._add_num(left, "3bet IP size (bb)", "threebet_ip", 3.0, 20.0, 0.5)
+        self._add_num(left, "3bet OOP size (bb)", "threebet_oop", 3.0, 24.0, 0.5)
+        self._add_num(left, "Rake %", "rake_pct", 0.0, 0.12, 0.005, is_pct=True)
+        self._add_num(left, "Rake cap (bb)", "rake_cap_bb", 0.0, 5.0, 0.1)
+
+        ttk.Separator(left).pack(fill=tk.X, pady=8)
+
+        self._add_num(left, "Call req discount (loosen calls)", "call_req_discount", 0.0, 0.06, 0.005, is_pct=True)
+        self._add_num(left, "Realize IP vs open", "realize_ip_vs_open", 0.85, 1.20, 0.01)
+        self._add_num(left, "Realize OOP vs open", "realize_oop_vs_open", 0.70, 1.10, 0.01)
+        self._add_num(left, "Realize IP vs 3bet", "realize_ip_vs_3bet", 0.80, 1.15, 0.01)
+        self._add_num(left, "Realize OOP vs 3bet", "realize_oop_vs_3bet", 0.70, 1.10, 0.01)
+
+        ttk.Separator(left).pack(fill=tk.X, pady=8)
+
+        self.sb_limp_var = tk.BooleanVar(value=self.cfg.sb_limp_enabled)
+        ttk.Checkbutton(left, text="Enable SB limps (RFI_SB)", variable=self.sb_limp_var,
+                        command=self._on_cfg_change).pack(anchor="w")
+
+        ttk.Separator(left).pack(fill=tk.X, pady=8)
+
+        ttk.Label(left, text="RFI looseness (0..1)", font=("Arial", 10, "bold")).pack(anchor="w")
+        self.rfi_vars: Dict[str, tk.DoubleVar] = {}
+        for p in ["UTG", "UTG1", "LJ", "HJ", "CO", "BTN", "SB"]:
+            v = tk.DoubleVar(value=self.cfg.rfi_loose.get(p, 0.0))
+            self.rfi_vars[p] = v
+            row = ttk.Frame(left)
+            row.pack(fill=tk.X, pady=2)
+            ttk.Label(row, text=p, width=6).pack(side=tk.LEFT)
+            s = ttk.Scale(row, from_=0.0, to=1.0, variable=v, command=lambda _=None: self._on_cfg_change())
+            s.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=6)
+            ttk.Label(row, textvariable=tk.StringVar(value="")).pack_forget()
+
+        # Right: Practice + Chart panels
+        self.practice_frame = ttk.Frame(right)
+        self.chart_frame = ttk.Frame(right)
+
+        # Practice panel
+        ttk.Label(self.practice_frame, text="Practice", font=("Arial", 12, "bold")).pack(anchor="w")
+
+        pr_top = ttk.Frame(self.practice_frame)
+        pr_top.pack(fill=tk.X, pady=6)
+
+        ttk.Label(pr_top, text="Hand:").pack(side=tk.LEFT)
+        self.hand_entry = ttk.Entry(pr_top, textvariable=self.current_hand, width=8)
+        self.hand_entry.pack(side=tk.LEFT, padx=6)
+        ttk.Button(pr_top, text="Set hand", command=self._set_hand_from_entry).pack(side=tk.LEFT, padx=4)
+
+        self.prompt_lbl = ttk.Label(self.practice_frame, text="", font=("Arial", 12))
+        self.prompt_lbl.pack(anchor="w", pady=(10, 4))
+
+        self.mix_lbl = ttk.Label(self.practice_frame, text="", font=("Consolas", 11))
+        self.mix_lbl.pack(anchor="w", pady=(2, 10))
+
+        btns = ttk.Frame(self.practice_frame)
+        btns.pack(anchor="w", pady=6)
+        self.act_btn1 = ttk.Button(btns, text="A", command=lambda: self._answer(0))
+        self.act_btn2 = ttk.Button(btns, text="B", command=lambda: self._answer(1))
+        self.act_btn3 = ttk.Button(btns, text="C", command=lambda: self._answer(2))
+        for b in (self.act_btn1, self.act_btn2, self.act_btn3):
+            b.pack(side=tk.LEFT, padx=6)
+
+        self.result_lbl = ttk.Label(self.practice_frame, text="")
+        self.result_lbl.pack(anchor="w", pady=(8, 2))
+
+        self.score_lbl = ttk.Label(self.practice_frame, text="Score: 0/0")
+        self.score_lbl.pack(anchor="w", pady=(2, 2))
+
+        ttk.Button(self.practice_frame, text="Next (random)", command=self._next_question).pack(anchor="w", pady=8)
+
+        # Chart panel
+        ttk.Label(self.chart_frame, text="Chart", font=("Arial", 12, "bold")).pack(anchor="w")
+        ttk.Label(self.chart_frame, text="Grid shows R/C/F for each hand class; updates live with variables.").pack(anchor="w", pady=(0, 6))
+
+        chart_controls = ttk.Frame(self.chart_frame)
+        chart_controls.pack(fill=tk.X, pady=4)
+        ttk.Label(chart_controls, text="Cell display:").pack(side=tk.LEFT)
+        self.cell_mode = tk.StringVar(value="Raise%")
+        ttk.OptionMenu(chart_controls, self.cell_mode, self.cell_mode.get(), "Raise%", "Call%", "Fold%", "All",
+                       command=lambda _: self._refresh_chart()).pack(side=tk.LEFT, padx=6)
+
+        self.chart_canvas = tk.Canvas(self.chart_frame, bg="white", highlightthickness=1, highlightbackground="#ccc")
+        self.chart_canvas.pack(fill=tk.BOTH, expand=True, pady=6)
+
+        self.chart_canvas.bind("<Button-1>", self._chart_click)
+
+    def _add_num(self, parent, label, attr, mn, mx, step, is_pct=False):
+        frame = ttk.Frame(parent)
+        frame.pack(fill=tk.X, pady=2)
+        ttk.Label(frame, text=label, width=26).pack(side=tk.LEFT)
+
+        var = tk.DoubleVar(value=getattr(self.cfg, attr))
+        entry = ttk.Entry(frame, textvariable=var, width=10)
+        entry.pack(side=tk.LEFT, padx=4)
+
+        def on_entry(_=None):
+            try:
+                val = float(var.get())
+                if is_pct and val > 1.0:
+                    # allow user to type 5 as 5%
+                    val = val / 100.0
+                    var.set(val)
+                val = max(mn, min(mx, val))
+                setattr(self.cfg, attr, val)
+                self._on_cfg_change()
+            except Exception:
+                pass
+
+        entry.bind("<Return>", on_entry)
+        entry.bind("<FocusOut>", on_entry)
+
+        scale = ttk.Scale(frame, from_=mn, to=mx, command=lambda _: on_entry())
+        scale.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=6)
+
+        def sync_scale():
+            try:
+                scale.set(float(var.get()))
+            except Exception:
+                pass
+
+        sync_scale()
+
+        # store a small hook so typing updates scale too
+        def trace(*_):
+            sync_scale()
+        var.trace_add("write", trace)
+
+        # also keep var in sync when scale moves
+        def on_scale(val):
+            try:
+                var.set(float(val))
+            except Exception:
+                pass
+        scale.configure(command=on_scale)
+
+        # and ensure cfg updates when var changes
+        var.trace_add("write", lambda *_: on_entry())
+
+    # ---------- Spots ----------
+    def _all_spots(self) -> List[str]:
+        spots = []
+        # RFI
+        for p in POSITIONS:
+            if p == "BB":
+                continue
+            spots.append(f"RFI_{p}")
+        # vs open
+        for opener in POSITIONS:
+            if opener == "BB":
+                continue
+            for hero in POSITIONS:
+                if POS_I[hero] <= POS_I[opener]:
+                    continue
+                spots.append(f"VS_{opener}_OPEN_{hero}")
+        # vs 3bet
+        for opener in POSITIONS:
+            if opener == "BB":
+                continue
+            for tb in POSITIONS:
+                if POS_I[tb] <= POS_I[opener]:
+                    continue
+                spots.append(f"RFI_{opener}_VS_3BET_{tb}")
+        return spots
+
+    # ---------- Events ----------
+    def _on_cfg_change(self):
+        # pull SB limp
+        self.cfg.sb_limp_enabled = bool(self.sb_limp_var.get())
+        # pull rfi looseness sliders
+        for p, v in self.rfi_vars.items():
+            self.cfg.rfi_loose[p] = float(v.get())
+        self._refresh_all()
+
+    def _set_hand_from_entry(self):
+        try:
+            self.current_hand.set(parse_hand_label(self.current_hand.get()))
+        except Exception:
+            pass
+        self._refresh_all()
+
+    def _random_hand(self):
+        self.current_hand.set(random.choice(ALL_169))
+        self._refresh_all()
+
+    def _random_spot(self):
+        self.current_spot.set(random.choice(self._all_spots()))
+        self._refresh_all()
+
+    # ---------- Practice ----------
+    def _next_question(self):
+        if not self.lock_spot.get():
+            self.current_spot.set(random.choice(self._all_spots()))
+        self.current_hand.set(random.choice(ALL_169))
+        self.result_lbl.config(text="")
+        self._refresh_practice()
+
+    def _answer(self, idx: int):
+        spot = self.current_spot.get()
+        hand = self.current_hand.get()
+        freqs = compute_freqs(self.cfg, spot, hand)  # (R,C,F)
+        sampled = sample_action_from_freqs(freqs)    # "R"/"C"/"F"
+        self.last_sampled = sampled
+
+        labels = spot_actions(spot)
+        chosen = ["R", "C", "F"][idx]
+
+        self.total += 1
+        if chosen == sampled:
+            self.score += 1
+            verdict = "✅ Correct (mixed-frequency draw)"
         else:
-            print(f"❌ Not this time. Sampled action was: {internal_to_display(spot, sampled_internal)}")
+            verdict = f"❌ Not this time. Sampled action was: {labels[['R','C','F'].index(sampled)]}"
+        self.result_lbl.config(text=verdict)
+        self.score_lbl.config(text=f"Score: {self.score}/{self.total}")
+        self._refresh_practice()
 
-        print(explain(spot, freqs))
-        print(f"Score: {score}/{total} ({(score/total)*100:.1f}%)")
+    # ---------- Refresh ----------
+    def _refresh_all(self):
+        # clamp/validate hand label if user typed
+        try:
+            self.current_hand.set(parse_hand_label(self.current_hand.get()))
+        except Exception:
+            # keep as-is
+            pass
 
-        last_info = (spot, hand, freqs, sampled_internal)
+        # show correct panel
+        if self.mode.get() == "Practice":
+            self.chart_frame.pack_forget()
+            self.practice_frame.pack(fill=tk.BOTH, expand=True)
+            self._refresh_practice()
+        else:
+            self.practice_frame.pack_forget()
+            self.chart_frame.pack(fill=tk.BOTH, expand=True)
+            self._refresh_chart()
 
-    print(f"\nFinal: {score}/{total} ({(score/total)*100:.1f}%)")
+    def _refresh_practice(self):
+        spot = self.current_spot.get()
+        hand = self.current_hand.get()
 
+        try:
+            freqs = compute_freqs(self.cfg, spot, hand)
+        except Exception as e:
+            self.prompt_lbl.config(text=f"Error: {e}")
+            return
 
+        a1, a2, a3 = spot_actions(spot)
+        self.act_btn1.config(text=a1)
+        self.act_btn2.config(text=a2)
+        self.act_btn3.config(text=a3)
+
+        self.prompt_lbl.config(text=f"Spot: {spot}    Hand: {hand}    Choose: {a1} / {a2} / {a3}")
+        r, c, f = freqs
+        self.mix_lbl.config(text=f"Target mix: {a1} {fmt_pct(r)}   {a2} {fmt_pct(c)}   {a3} {fmt_pct(f)}")
+
+    # ---------- Chart drawing ----------
+    def _refresh_chart(self):
+        spot = self.current_spot.get()
+        mode = self.cell_mode.get()
+        w = self.chart_canvas.winfo_width()
+        h = self.chart_canvas.winfo_height()
+        if w < 50 or h < 50:
+            self.after(50, self._refresh_chart)
+            return
+
+        self.chart_canvas.delete("all")
+
+        # layout
+        pad = 10
+        header = 24
+        cell = min((w - pad*2 - header) / 13, (h - pad*2 - header) / 13)
+        cell = max(18, min(cell, 46))  # keep readable
+        grid_w = header + cell * 13
+        grid_h = header + cell * 13
+
+        x0 = pad
+        y0 = pad
+
+        # title
+        a1, a2, a3 = spot_actions(spot)
+        self.chart_canvas.create_text(x0, y0-2, anchor="sw",
+                                      text=f"{spot}   (R={a1}, C={a2}, F={a3})   Display: {mode}")
+
+        # headers
+        for j, r in enumerate(CHART_RANKS):
+            x = x0 + header + j * cell + cell/2
+            self.chart_canvas.create_text(x, y0 + header/2, text=r)
+        for i, r in enumerate(CHART_RANKS):
+            y = y0 + header + i * cell + cell/2
+            self.chart_canvas.create_text(x0 + header/2, y, text=r)
+
+        # grid
+        for i, rr in enumerate(CHART_RANKS):
+            for j, cc in enumerate(CHART_RANKS):
+                hand = cell_hand_label(rr, cc)
+                freqs = compute_freqs(self.cfg, spot, hand)
+                r, c, f = freqs
+
+                # cell coords
+                x1 = x0 + header + j * cell
+                y1 = y0 + header + i * cell
+                x2 = x1 + cell
+                y2 = y1 + cell
+
+                # simple shading: higher raise => darker
+                shade = int(255 - (r * 140))
+                shade = max(90, min(255, shade))
+                fill = f"#{shade:02x}{shade:02x}{shade:02x}"
+                self.chart_canvas.create_rectangle(x1, y1, x2, y2, fill=fill, outline="#ddd")
+
+                if mode == "Raise%":
+                    txt = f"{round(r*100)}"
+                elif mode == "Call%":
+                    txt = f"{round(c*100)}"
+                elif mode == "Fold%":
+                    txt = f"{round(f*100)}"
+                else:
+                    txt = f"{round(r*100)}/{round(c*100)}/{round(f*100)}"
+
+                self.chart_canvas.create_text((x1+x2)/2, (y1+y2)/2, text=txt, font=("Consolas", 9))
+
+        # border
+        self.chart_canvas.create_rectangle(x0+header, y0+header, x0+grid_w, y0+grid_h, outline="#aaa")
+
+        # help text
+        self.chart_canvas.create_text(x0, y0+grid_h+14, anchor="nw",
+                                      text="Tip: click a cell to set Practice hand to that combo class.")
+
+    def _chart_click(self, event):
+        # Convert click to cell, set hand
+        spot = self.current_spot.get()
+        w = self.chart_canvas.winfo_width()
+        h = self.chart_canvas.winfo_height()
+        pad = 10
+        header = 24
+        cell = min((w - pad*2 - header) / 13, (h - pad*2 - header) / 13)
+        cell = max(18, min(cell, 46))
+        x0 = pad
+        y0 = pad
+
+        x = event.x
+        y = event.y
+        gx = x - (x0 + header)
+        gy = y - (y0 + header)
+        if gx < 0 or gy < 0:
+            return
+        j = int(gx // cell)
+        i = int(gy // cell)
+        if not (0 <= i < 13 and 0 <= j < 13):
+            return
+        rr = CHART_RANKS[i]
+        cc = CHART_RANKS[j]
+        hand = cell_hand_label(rr, cc)
+        self.current_hand.set(hand)
+        self.mode.set("Practice")
+        self._refresh_all()
+
+# -----------------------------
+# Run
+# -----------------------------
 if __name__ == "__main__":
-    main()
+    app = App()
+    app.mainloop()
