@@ -1,18 +1,9 @@
 """
 Real-time 8-max cash preflop "math-ish" trainer (NO CSV) + UI (tkinter)
 
-What it does
-- Computes frequencies on-the-fly (R/C/F) for:
-  1) RFI_<POS>                  -> RAISE / LIMP / FOLD  (CALL internally = LIMP)
-  2) VS_<OPENER>_OPEN_<HERO>    -> 3BET / CALL / FOLD   (RAISE internally = 3BET)
-  3) RFI_<OPENER>_VS_3BET_<X>   -> 4BET / CALL / FOLD   (RAISE internally = 4BET)
-- All key variables editable in the UI (open size, 3bet sizes, rake, etc.)
-- Practice mode: random hand + random spot, you answer, it scores you.
-- Chart mode: shows a 13x13 grid for the selected spot; updates live when you change variables.
-
-Important
-- This is NOT solver GTO. It’s a “real-world math-shaped baseline”:
-  pot-odds + rake penalty + rough strength proxy (Chen-ish) + blocker/playability logic.
+Updated behavior (what you asked):
+- BEFORE you choose: does NOT show the mix (mix label is blank)
+- AFTER you choose: shows mix + your chosen action % + sampled action %
 """
 
 import random
@@ -41,7 +32,7 @@ def clamp01(x: float) -> float:
     return max(0.0, min(1.0, x))
 
 def fmt_pct(x: float) -> str:
-    return f"{round(x*100):>3d}%"
+    return f"{x*100:.1f}%"
 
 def normalize_rcf(r: float, c: float, f: float) -> Tuple[float, float, float]:
     s = r + c + f
@@ -57,7 +48,6 @@ def cell_hand_label(row_rank: str, col_rank: str) -> str:
     col_i = IDX[col_rank]
     if row_i < col_i:
         return f"{row_rank}{col_rank}s"
-    # below diagonal: ensure high-low
     hi = col_rank if IDX[col_rank] < IDX[row_rank] else row_rank
     lo = row_rank if hi == col_rank else col_rank
     return f"{hi}{lo}o"
@@ -71,9 +61,8 @@ def parse_hand_label(lbl: str) -> str:
         if a == b:
             return a + a
         # normalize hi/lo
-        if IDX[a] > IDX[b]:  # remember A=0 is "higher", so bigger index means lower rank
+        if IDX[a] > IDX[b]:  # A=0 is highest; bigger index means lower rank
             a, b = b, a
-        # now a is higher in chart-order sense (lower index)
         return f"{a}{b}{t}"
     raise ValueError(f"Bad hand label: {lbl}")
 
@@ -110,7 +99,7 @@ class Config:
     # SB limps
     sb_limp_enabled: bool = True
 
-    # RFI looseness by position (equity threshold shifts)
+    # RFI looseness by position
     rfi_loose: Dict[str, float] = None
 
     def __post_init__(self):
@@ -219,12 +208,9 @@ def target_4bet_pct(opener: str, threebettor: str) -> float:
 
 def freqs_rfi(cfg: Config, hand: str, pos: str) -> Tuple[float, float, float]:
     """(raise, limp, fold) encoded as (R, C, F)."""
-    s = chen_score(hand)
-    eq = score_to_equity(s)
-
+    eq = score_to_equity(chen_score(hand))
     loose = cfg.rfi_loose.get(pos, 0.0)
-    thr = 0.49 - 0.09 * loose  # lower threshold late
-
+    thr = 0.49 - 0.09 * loose
     open_frac = clamp01((eq - (thr - 0.05)) / 0.10)
     if open_frac <= 0:
         return (0.0, 0.0, 1.0)
@@ -244,8 +230,7 @@ def freqs_rfi(cfg: Config, hand: str, pos: str) -> Tuple[float, float, float]:
 
 def freqs_vs_open(cfg: Config, hand: str, hero: str, opener: str) -> Tuple[float, float, float]:
     """(3bet, call, fold) encoded as (R, C, F)."""
-    s = chen_score(hand)
-    eq = score_to_equity(s)
+    eq = score_to_equity(chen_score(hand))
 
     ip = is_in_position(hero, opener)
     pot0 = 1.5 + cfg.open_size_bb
@@ -280,8 +265,7 @@ def freqs_vs_open(cfg: Config, hand: str, hero: str, opener: str) -> Tuple[float
 
 def freqs_vs_3bet(cfg: Config, hand: str, opener: str, threebettor: str) -> Tuple[float, float, float]:
     """(4bet, call, fold) encoded as (R, C, F)."""
-    s = chen_score(hand)
-    eq = score_to_equity(s)
+    eq = score_to_equity(chen_score(hand))
 
     ip = is_in_position(opener, threebettor)
     size3 = cfg.threebet_ip if ip else cfg.threebet_oop
@@ -296,8 +280,7 @@ def freqs_vs_3bet(cfg: Config, hand: str, opener: str, threebettor: str) -> Tupl
     call_frac = clamp01((eq_eff - (req_call - 0.03)) / 0.08)
 
     tgt4 = target_4bet_pct(opener, threebettor)
-    value_thr = 0.64
-    value = clamp01((eq - (value_thr - 0.02)) / 0.05)
+    value = clamp01((eq - (0.64 - 0.02)) / 0.05)
 
     b = blockers(hand)
     bluff_seed = clamp01(0.70 * b - 0.85 * eq + 0.10 * playability(hand))
@@ -339,12 +322,6 @@ def spot_actions(spot: str) -> Tuple[str, str, str]:
     return ("RAISE", "CALL", "FOLD")
 
 def parse_spot_parts(spot: str) -> Tuple[str, str, Optional[str]]:
-    """
-    Returns (type, a, b)
-    - RFI_POS -> ("RFI", POS, None)
-    - VS_OPENER_OPEN_HERO -> ("VSOPEN", OPENER, HERO)
-    - RFI_OPENER_VS_3BET_THREEBETTOR -> ("VS3B", OPENER, THREEBETTOR)
-    """
     s = spot.strip()
     if s.startswith("RFI_") and "_VS_3BET_" not in s:
         return ("RFI", s.split("_", 1)[1], None)
@@ -391,26 +368,30 @@ class App(tk.Tk):
         self.current_spot = tk.StringVar(value="RFI_BTN")
         self.current_hand = tk.StringVar(value="AKs")
         self.lock_spot = tk.BooleanVar(value=False)
+
         self.score = 0
         self.total = 0
-        self.last_sampled = None  # ("R"/"C"/"F")
+        self.last_sampled: Optional[str] = None
+
+        # NEW: hide mix until answered
+        self.answered = False
 
         self._build_ui()
         self._refresh_all()
 
     # ---------- Build ----------
     def _build_ui(self):
-        # Top bar
         top = ttk.Frame(self, padding=8)
         top.pack(side=tk.TOP, fill=tk.X)
 
         ttk.Label(top, text="Mode:").pack(side=tk.LEFT)
-        ttk.OptionMenu(top, self.mode, self.mode.get(), "Practice", "Chart", command=lambda _: self._refresh_all()).pack(side=tk.LEFT, padx=6)
+        ttk.OptionMenu(top, self.mode, self.mode.get(), "Practice", "Chart",
+                       command=lambda _: self._refresh_all()).pack(side=tk.LEFT, padx=6)
 
         ttk.Label(top, text="Spot:").pack(side=tk.LEFT, padx=(14, 2))
         self.spot_menu = ttk.Combobox(top, textvariable=self.current_spot, width=32, state="readonly")
         self.spot_menu["values"] = self._all_spots()
-        self.spot_menu.bind("<<ComboboxSelected>>", lambda e: self._refresh_all())
+        self.spot_menu.bind("<<ComboboxSelected>>", lambda e: self._on_new_question())
         self.spot_menu.pack(side=tk.LEFT)
 
         ttk.Checkbutton(top, text="Lock spot (Practice)", variable=self.lock_spot).pack(side=tk.LEFT, padx=10)
@@ -420,7 +401,6 @@ class App(tk.Tk):
 
         ttk.Separator(self).pack(side=tk.TOP, fill=tk.X, pady=4)
 
-        # Main split
         main = ttk.Frame(self, padding=8)
         main.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
 
@@ -430,7 +410,6 @@ class App(tk.Tk):
         right = ttk.Frame(main)
         right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-        # Left: Config controls
         ttk.Label(left, text="Variables (live)", font=("Arial", 12, "bold")).pack(anchor="w", pady=(0, 6))
 
         self._add_num(left, "Open size (bb)", "open_size_bb", 0.5, 6.0, 0.1)
@@ -465,9 +444,8 @@ class App(tk.Tk):
             ttk.Label(row, text=p, width=6).pack(side=tk.LEFT)
             s = ttk.Scale(row, from_=0.0, to=1.0, variable=v, command=lambda _=None: self._on_cfg_change())
             s.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=6)
-            ttk.Label(row, textvariable=tk.StringVar(value="")).pack_forget()
 
-        # Right: Practice + Chart panels
+        # Right panels
         self.practice_frame = ttk.Frame(right)
         self.chart_frame = ttk.Frame(right)
 
@@ -496,7 +474,7 @@ class App(tk.Tk):
         for b in (self.act_btn1, self.act_btn2, self.act_btn3):
             b.pack(side=tk.LEFT, padx=6)
 
-        self.result_lbl = ttk.Label(self.practice_frame, text="")
+        self.result_lbl = ttk.Label(self.practice_frame, text="", justify="left")
         self.result_lbl.pack(anchor="w", pady=(8, 2))
 
         self.score_lbl = ttk.Label(self.practice_frame, text="Score: 0/0")
@@ -517,7 +495,6 @@ class App(tk.Tk):
 
         self.chart_canvas = tk.Canvas(self.chart_frame, bg="white", highlightthickness=1, highlightbackground="#ccc")
         self.chart_canvas.pack(fill=tk.BOTH, expand=True, pady=6)
-
         self.chart_canvas.bind("<Button-1>", self._chart_click)
 
     def _add_num(self, parent, label, attr, mn, mx, step, is_pct=False):
@@ -533,7 +510,6 @@ class App(tk.Tk):
             try:
                 val = float(var.get())
                 if is_pct and val > 1.0:
-                    # allow user to type 5 as 5%
                     val = val / 100.0
                     var.set(val)
                 val = max(mn, min(mx, val))
@@ -555,56 +531,41 @@ class App(tk.Tk):
                 pass
 
         sync_scale()
-
-        # store a small hook so typing updates scale too
-        def trace(*_):
-            sync_scale()
-        var.trace_add("write", trace)
-
-        # also keep var in sync when scale moves
-        def on_scale(val):
-            try:
-                var.set(float(val))
-            except Exception:
-                pass
-        scale.configure(command=on_scale)
-
-        # and ensure cfg updates when var changes
+        var.trace_add("write", lambda *_: sync_scale())
+        scale.configure(command=lambda val: var.set(float(val)))
         var.trace_add("write", lambda *_: on_entry())
 
     # ---------- Spots ----------
     def _all_spots(self) -> List[str]:
         spots = []
-        # RFI
         for p in POSITIONS:
-            if p == "BB":
-                continue
-            spots.append(f"RFI_{p}")
-        # vs open
+            if p != "BB":
+                spots.append(f"RFI_{p}")
         for opener in POSITIONS:
             if opener == "BB":
                 continue
             for hero in POSITIONS:
-                if POS_I[hero] <= POS_I[opener]:
-                    continue
-                spots.append(f"VS_{opener}_OPEN_{hero}")
-        # vs 3bet
+                if POS_I[hero] > POS_I[opener]:
+                    spots.append(f"VS_{opener}_OPEN_{hero}")
         for opener in POSITIONS:
             if opener == "BB":
                 continue
             for tb in POSITIONS:
-                if POS_I[tb] <= POS_I[opener]:
-                    continue
-                spots.append(f"RFI_{opener}_VS_3BET_{tb}")
+                if POS_I[tb] > POS_I[opener]:
+                    spots.append(f"RFI_{opener}_VS_3BET_{tb}")
         return spots
 
     # ---------- Events ----------
     def _on_cfg_change(self):
-        # pull SB limp
         self.cfg.sb_limp_enabled = bool(self.sb_limp_var.get())
-        # pull rfi looseness sliders
         for p, v in self.rfi_vars.items():
             self.cfg.rfi_loose[p] = float(v.get())
+        self._refresh_all()
+
+    def _on_new_question(self):
+        # any manual change to spot/hand resets "answered"
+        self.answered = False
+        self.result_lbl.config(text="")
         self._refresh_all()
 
     def _set_hand_from_entry(self):
@@ -612,54 +573,71 @@ class App(tk.Tk):
             self.current_hand.set(parse_hand_label(self.current_hand.get()))
         except Exception:
             pass
-        self._refresh_all()
+        self._on_new_question()
 
     def _random_hand(self):
         self.current_hand.set(random.choice(ALL_169))
-        self._refresh_all()
+        self._on_new_question()
 
     def _random_spot(self):
         self.current_spot.set(random.choice(self._all_spots()))
-        self._refresh_all()
+        self._on_new_question()
 
     # ---------- Practice ----------
     def _next_question(self):
         if not self.lock_spot.get():
             self.current_spot.set(random.choice(self._all_spots()))
         self.current_hand.set(random.choice(ALL_169))
+        self.answered = False
         self.result_lbl.config(text="")
         self._refresh_practice()
 
     def _answer(self, idx: int):
         spot = self.current_spot.get()
         hand = self.current_hand.get()
+
         freqs = compute_freqs(self.cfg, spot, hand)  # (R,C,F)
         sampled = sample_action_from_freqs(freqs)    # "R"/"C"/"F"
         self.last_sampled = sampled
 
-        labels = spot_actions(spot)
+        labels = spot_actions(spot)  # (action1, action2, action3)
         chosen = ["R", "C", "F"][idx]
+
+        r, c, f = freqs
+        chosen_pct = {"R": r, "C": c, "F": f}[chosen]
+        sampled_pct = {"R": r, "C": c, "F": f}[sampled]
+
+        chosen_label = labels[["R","C","F"].index(chosen)]
+        sampled_label = labels[["R","C","F"].index(sampled)]
 
         self.total += 1
         if chosen == sampled:
             self.score += 1
             verdict = "✅ Correct (mixed-frequency draw)"
         else:
-            verdict = f"❌ Not this time. Sampled action was: {labels[['R','C','F'].index(sampled)]}"
-        self.result_lbl.config(text=verdict)
+            verdict = "❌ Not this time"
+
+        # Mark answered so mix becomes visible
+        self.answered = True
+
+        breakdown = (
+            f"{verdict}\n"
+            f"Mix: {labels[0]} {fmt_pct(r)}   {labels[1]} {fmt_pct(c)}   {labels[2]} {fmt_pct(f)}\n"
+            f"You chose: {chosen_label} ({fmt_pct(chosen_pct)})\n"
+            f"Sampled: {sampled_label} ({fmt_pct(sampled_pct)})"
+        )
+
+        self.result_lbl.config(text=breakdown)
         self.score_lbl.config(text=f"Score: {self.score}/{self.total}")
         self._refresh_practice()
 
     # ---------- Refresh ----------
     def _refresh_all(self):
-        # clamp/validate hand label if user typed
         try:
             self.current_hand.set(parse_hand_label(self.current_hand.get()))
         except Exception:
-            # keep as-is
             pass
 
-        # show correct panel
         if self.mode.get() == "Practice":
             self.chart_frame.pack_forget()
             self.practice_frame.pack(fill=tk.BOTH, expand=True)
@@ -685,62 +663,70 @@ class App(tk.Tk):
         self.act_btn3.config(text=a3)
 
         self.prompt_lbl.config(text=f"Spot: {spot}    Hand: {hand}    Choose: {a1} / {a2} / {a3}")
+
+        # IMPORTANT: hide mix until answered
         r, c, f = freqs
-        self.mix_lbl.config(text=f"Target mix: {a1} {fmt_pct(r)}   {a2} {fmt_pct(c)}   {a3} {fmt_pct(f)}")
+        if self.answered:
+            self.mix_lbl.config(text=f"Mix: {a1} {fmt_pct(r)}   {a2} {fmt_pct(c)}   {a3} {fmt_pct(f)}")
+        else:
+            self.mix_lbl.config(text="")
 
     # ---------- Chart drawing ----------
     def _refresh_chart(self):
         spot = self.current_spot.get()
         mode = self.cell_mode.get()
+
         w = self.chart_canvas.winfo_width()
         h = self.chart_canvas.winfo_height()
         if w < 50 or h < 50:
-            self.after(50, self._refresh_chart)
             return
 
         self.chart_canvas.delete("all")
 
-        # layout
         pad = 10
         header = 24
-        cell = min((w - pad*2 - header) / 13, (h - pad*2 - header) / 13)
-        cell = max(18, min(cell, 46))  # keep readable
-        grid_w = header + cell * 13
-        grid_h = header + cell * 13
+        bottom_text = 26
+
+        usable_w = max(10, w - pad*2 - header)
+        usable_h = max(10, h - pad*2 - header - bottom_text)
+
+        cell = min(usable_w / 13, usable_h / 13)
+        cell = max(10, cell)  # don't clip; just shrink cells
 
         x0 = pad
         y0 = pad
 
-        # title
         a1, a2, a3 = spot_actions(spot)
-        self.chart_canvas.create_text(x0, y0-2, anchor="sw",
-                                      text=f"{spot}   (R={a1}, C={a2}, F={a3})   Display: {mode}")
 
-        # headers
-        for j, r in enumerate(CHART_RANKS):
+        # Title (inside canvas to avoid negative y)
+        self.chart_canvas.create_text(
+            x0, y0, anchor="nw",
+            text=f"{spot}   (R={a1}, C={a2}, F={a3})   Display: {mode}"
+        )
+
+        # Headers
+        for j, rnk in enumerate(CHART_RANKS):
             x = x0 + header + j * cell + cell/2
-            self.chart_canvas.create_text(x, y0 + header/2, text=r)
-        for i, r in enumerate(CHART_RANKS):
+            self.chart_canvas.create_text(x, y0 + header/2, text=rnk)
+        for i, rnk in enumerate(CHART_RANKS):
             y = y0 + header + i * cell + cell/2
-            self.chart_canvas.create_text(x0 + header/2, y, text=r)
+            self.chart_canvas.create_text(x0 + header/2, y, text=rnk)
 
-        # grid
+        # Cells
         for i, rr in enumerate(CHART_RANKS):
             for j, cc in enumerate(CHART_RANKS):
                 hand = cell_hand_label(rr, cc)
-                freqs = compute_freqs(self.cfg, spot, hand)
-                r, c, f = freqs
+                r, c, f = compute_freqs(self.cfg, spot, hand)
 
-                # cell coords
                 x1 = x0 + header + j * cell
                 y1 = y0 + header + i * cell
                 x2 = x1 + cell
                 y2 = y1 + cell
 
-                # simple shading: higher raise => darker
                 shade = int(255 - (r * 140))
                 shade = max(90, min(255, shade))
                 fill = f"#{shade:02x}{shade:02x}{shade:02x}"
+
                 self.chart_canvas.create_rectangle(x1, y1, x2, y2, fill=fill, outline="#ddd")
 
                 if mode == "Raise%":
@@ -754,16 +740,23 @@ class App(tk.Tk):
 
                 self.chart_canvas.create_text((x1+x2)/2, (y1+y2)/2, text=txt, font=("Consolas", 9))
 
-        # border
-        self.chart_canvas.create_rectangle(x0+header, y0+header, x0+grid_w, y0+grid_h, outline="#aaa")
+        # Border
+        grid_x1 = x0 + header
+        grid_y1 = y0 + header
+        grid_x2 = x0 + header + 13*cell
+        grid_y2 = y0 + header + 13*cell
+        self.chart_canvas.create_rectangle(grid_x1, grid_y1, grid_x2, grid_y2, outline="#aaa")
 
-        # help text
-        self.chart_canvas.create_text(x0, y0+grid_h+14, anchor="nw",
-                                      text="Tip: click a cell to set Practice hand to that combo class.")
+        # Help text
+        self.chart_canvas.create_text(
+            x0, grid_y2 + 6, anchor="nw",
+            text="Tip: click a cell to set Practice hand to that combo class."
+        )
+
+        # Scrollregion (optional, but keeps bounds sane)
+        self.chart_canvas.config(scrollregion=(0, 0, max(w, grid_x2 + pad), max(h, grid_y2 + pad + 40)))
 
     def _chart_click(self, event):
-        # Convert click to cell, set hand
-        spot = self.current_spot.get()
         w = self.chart_canvas.winfo_width()
         h = self.chart_canvas.winfo_height()
         pad = 10
@@ -773,10 +766,8 @@ class App(tk.Tk):
         x0 = pad
         y0 = pad
 
-        x = event.x
-        y = event.y
-        gx = x - (x0 + header)
-        gy = y - (y0 + header)
+        gx = event.x - (x0 + header)
+        gy = event.y - (y0 + header)
         if gx < 0 or gy < 0:
             return
         j = int(gx // cell)
@@ -788,6 +779,8 @@ class App(tk.Tk):
         hand = cell_hand_label(rr, cc)
         self.current_hand.set(hand)
         self.mode.set("Practice")
+        self.answered = False
+        self.result_lbl.config(text="")
         self._refresh_all()
 
 # -----------------------------

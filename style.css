@@ -1,53 +1,59 @@
 :root{
-    --bg:#0b0f14;
-    --card:#121923;
-    --text:#e6edf3;
-    --muted:#9fb0c0;
-    --line:#233142;
-    --btn:#1f2a38;
-    --btn2:#2a3a50;
-    --good:#2ecc71;
-    --bad:#ff5c5c;
-  }
-  
-  *{box-sizing:border-box}
-  body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;background:var(--bg);color:var(--text)}
-  .wrap{max-width:1100px;margin:0 auto;padding:16px}
-  h1{margin:0 0 6px 0;font-size:28px}
-  .sub{margin:0;color:var(--muted)}
-  .grid{display:grid;grid-template-columns: 380px 1fr;gap:14px}
-  .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px}
-  hr{border:0;border-top:1px solid var(--line);margin:12px 0}
-  .row{display:flex;align-items:center;gap:10px;margin:8px 0}
-  .row label{width:160px;color:var(--muted)}
-  .row input, .row select{flex:1;background:#0e141d;border:1px solid var(--line);color:var(--text);padding:8px;border-radius:10px}
-  .row button{background:var(--btn);border:1px solid var(--line);color:var(--text);padding:8px 10px;border-radius:10px;cursor:pointer}
-  .row button:hover{background:var(--btn2)}
-  .vars .row label{width:170px}
-  
-  .big{font-size:18px;margin:8px 0}
-  .mono{font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; color:var(--muted)}
-  .btnRow{display:flex;gap:10px;margin:14px 0}
-  button.act{flex:1;background:var(--btn);border:1px solid var(--line);color:var(--text);padding:12px;border-radius:12px;font-size:16px}
-  button.act:hover{background:var(--btn2)}
-  .result{min-height:26px;margin:8px 0}
-  .result.good{color:var(--good)}
-  .result.bad{color:var(--bad)}
-  .hidden{display:none}
-  .foot{opacity:.9}
-  
-  .chartWrap{overflow:auto;border:1px solid var(--line);border-radius:12px;background:#0e141d;padding:10px}
-  #chart{display:grid;grid-template-columns: 34px repeat(13, 38px);gap:4px;align-items:stretch}
-  .cell, .hdr{
-    display:flex;align-items:center;justify-content:center;
-    border-radius:8px;
-    height:34px;
-    user-select:none;
-  }
-  .hdr{background:#0b1018;border:1px solid var(--line);color:var(--muted);font-weight:600}
-  .cell{
-    background:#101a28;border:1px solid var(--line);
-    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
-    font-size:12px; cursor:pointer;
-  }
-  .cell:hover{outline:2px solid #3b82f6}
+  --bg:#0b0f14;
+  --card:#121923;
+  --text:#e6edf3;
+  --muted:#9fb0c0;
+  --line:#233142;
+  --btn:#1f2a38;
+  --btn2:#2a3a50;
+  --good:#2ecc71;
+  --bad:#ff5c5c;
+}
+
+*{box-sizing:border-box}
+body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;background:var(--bg);color:var(--text)}
+.wrap{max-width:1100px;margin:0 auto;padding:16px}
+h1{margin:0 0 6px 0;font-size:28px}
+.sub{margin:0;color:var(--muted)}
+.grid{display:grid;grid-template-columns: 380px 1fr;gap:14px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px}
+hr{border:0;border-top:1px solid var(--line);margin:12px 0}
+.row{display:flex;align-items:center;gap:10px;margin:8px 0}
+.row label{width:160px;color:var(--muted)}
+.row input, .row select{flex:1;background:#0e141d;border:1px solid var(--line);color:var(--text);padding:8px;border-radius:10px}
+.row button{background:var(--btn);border:1px solid var(--line);color:var(--text);padding:8px 10px;border-radius:10px;cursor:pointer}
+.row button:hover{background:var(--btn2)}
+.vars .row label{width:170px}
+
+.big{font-size:18px;margin:8px 0}
+.mono{font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; color:var(--muted)}
+.btnRow{display:flex;gap:10px;margin:14px 0}
+button.act{flex:1;background:var(--btn);border:1px solid var(--line);color:var(--text);padding:12px;border-radius:12px;font-size:16px}
+button.act:hover{background:var(--btn2)}
+
+.result{
+  min-height:26px;
+  margin:8px 0;
+  white-space: pre-line; /* show \n line breaks */
+}
+.result.good{color:var(--good)}
+.result.bad{color:var(--bad)}
+
+.hidden{display:none}
+.foot{opacity:.9}
+
+.chartWrap{overflow:auto;border:1px solid var(--line);border-radius:12px;background:#0e141d;padding:10px}
+#chart{display:grid;grid-template-columns: 34px repeat(13, 38px);gap:4px;align-items:stretch}
+.cell, .hdr{
+  display:flex;align-items:center;justify-content:center;
+  border-radius:8px;
+  height:34px;
+  user-select:none;
+}
+.hdr{background:#0b1018;border:1px solid var(--line);color:var(--muted);font-weight:600}
+.cell{
+  background:#101a28;border:1px solid var(--line);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  font-size:12px; cursor:pointer;
+}
+.cell:hover{outline:2px solid #3b82f6}
