@@ -1,5 +1,6 @@
 // Poker Preflop Trainer (static, no CSV)
 // NOT solver GTO — “math-ish” baseline.
+// Update: hide target mix until user answers; show breakdown after answer.
 
 const CHART_RANKS = "AKQJT98765432";
 const IDX = Object.fromEntries([...CHART_RANKS].map((r,i)=>[r,i]));
@@ -99,11 +100,15 @@ function cfg(){
     rIP3: parseFloat($("rIP3").value),
     rOOP3: parseFloat($("rOOP3").value),
     sbLimp: $("sbLimp").checked,
-    rfiLoose: { UTG:0.05, UTG1:0.10, LJ:0.18, HJ:0.28, CO:0.45, BTN:0.62, SB:0.58 }
+    rfiLoose: {
+      UTG:0.05, UTG1:0.10, LJ:0.18, HJ:0.28, CO:0.45, BTN:0.62, SB:0.58
+    }
   };
 }
 
-function rakeTaken(c, pot){ return Math.min(pot*c.rakePct, c.rakeCap); }
+function rakeTaken(c, pot){
+  return Math.min(pot*c.rakePct, c.rakeCap);
+}
 
 function chenScore(hand){
   if(hand.length===2){
@@ -116,13 +121,11 @@ function chenScore(hand){
   const hi=hand[0], lo=hand[1], t=hand[2];
   let base = Math.max(CHEN_BASE[hi], CHEN_BASE[lo]);
   if(t==="s") base += 2;
-
   const gap = Math.abs(IDX[lo]-IDX[hi]);
   if(gap===1) base += 1;
   else if(gap===2) base -= 1;
   else if(gap===3) base -= 2;
   else if(gap>=4) base -= 4;
-
   if(t==="s" && "98765".includes(hi) && gap<=2) base += 0.5;
   return Math.max(0.0, base);
 }
@@ -178,7 +181,8 @@ function target4bet(opener, tb){
 
 // ----- freqs -----
 function freqsRFI(c, hand, pos){
-  const eq=scoreToEquity(chenScore(hand));
+  const score=chenScore(hand);
+  const eq=scoreToEquity(score);
   const loose = c.rfiLoose[pos] ?? 0.0;
   const thr = 0.49 - 0.09*loose;
   let openFrac = clamp01((eq - (thr - 0.05))/0.10);
@@ -200,11 +204,9 @@ function freqsRFI(c, hand, pos){
 function freqsVsOpen(c, hand, hero, opener){
   const eq=scoreToEquity(chenScore(hand));
   const ip=isIP(hero, opener);
-
   const pot0 = 1.5 + c.open;
   const callCost = c.open;
   const req = reqEquityCall(c, callCost, pot0);
-
   const realization = ip ? c.rIPo : c.rOOPo;
   const eqEff = clamp01(eq*realization);
   let callFrac = clamp01((eqEff - (req - 0.03))/0.08);
@@ -276,9 +278,19 @@ function sampleAction([r,c,f]){
   return "F";
 }
 
-// ----- app state -----
+// ----- state -----
 let score=0, total=0;
+let answered=false;
 
+// ----- UI helpers -----
+function clearAnswerUI(){
+  answered=false;
+  $("result").textContent="";
+  $("result").className="result";
+  $("mix").textContent=""; // hide
+}
+
+// ----- main panels -----
 function setMode(){
   const m=$("mode").value;
   $("panelTitle").textContent = (m==="practice") ? "Practice" : "Chart";
@@ -297,7 +309,13 @@ function refreshPractice(){
   const acts=spotActions(spot);
 
   $("prompt").textContent = `Spot: ${spot}   Hand: ${hand}   Choose: ${acts.join(" / ")}`;
-  $("mix").textContent = `Target mix: ${acts[0]} ${pct(r)}   ${acts[1]} ${pct(cc)}   ${acts[2]} ${pct(f)}`;
+
+  // IMPORTANT: hide mix until answered
+  if(answered){
+    $("mix").textContent = `Mix: ${acts[0]} ${pct(r)}   ${acts[1]} ${pct(cc)}   ${acts[2]} ${pct(f)}`;
+  }else{
+    $("mix").textContent = "";
+  }
 
   $("a1").textContent=acts[0];
   $("a2").textContent=acts[1];
@@ -305,38 +323,39 @@ function refreshPractice(){
 }
 
 function answer(idx){
-  const spot = $("spot").value;
-  const c = cfg();
-  const hand = parseHand($("hand").value);
+  const spot=$("spot").value;
+  const c=cfg();
+  const hand=parseHand($("hand").value);
+  const freqs=freqsForSpot(c, spot, hand);
+  const sampled=sampleAction(freqs);
+  const acts=spotActions(spot);
+  const chosen=["R","C","F"][idx];
 
-  const freqs = freqsForSpot(c, spot, hand);   // [r, call, fold]
-  const sampled = sampleAction(freqs);         // "R"/"C"/"F"
-  const acts = spotActions(spot);
-  const chosen = ["R","C","F"][idx];
-
-  const [r, ca, f] = freqs;
-  const chosenPct = (chosen === "R") ? r : (chosen === "C") ? ca : f;
-  const sampledPct = (sampled === "R") ? r : (sampled === "C") ? ca : f;
+  const [r,ca,f]=freqs;
+  const chosenPct = (chosen==="R") ? r : (chosen==="C") ? ca : f;
+  const sampledPct = (sampled==="R") ? r : (sampled==="C") ? ca : f;
 
   total += 1;
-  const res = $("result");
+  const res=$("result");
 
   const breakdown =
     `Mix: ${acts[0]} ${pct1(r)} • ${acts[1]} ${pct1(ca)} • ${acts[2]} ${pct1(f)}\n` +
     `You chose: ${acts[["R","C","F"].indexOf(chosen)]} (${pct1(chosenPct)})\n` +
     `Sampled: ${acts[["R","C","F"].indexOf(sampled)]} (${pct1(sampledPct)})`;
 
-  if (chosen === sampled){
+  if(chosen===sampled){
     score += 1;
     res.textContent = `✅ Correct\n${breakdown}`;
     res.className = "result good";
-  } else {
+  }else{
     res.textContent = `❌ Not this time\n${breakdown}`;
     res.className = "result bad";
   }
 
   $("score").textContent = `Score: ${score}/${total}`;
-  refreshPractice();
+
+  answered=true;     // IMPORTANT: reveal mix after answering
+  refreshPractice(); // re-render prompt + mix
 }
 
 function randomHand(){
@@ -350,24 +369,27 @@ function randomHand(){
     }
   }
   $("hand").value = hands[Math.floor(Math.random()*hands.length)];
+  clearAnswerUI();
   refreshPractice();
 }
 
 function randomSpot(){
   const spots=allSpots();
   $("spot").value = spots[Math.floor(Math.random()*spots.length)];
+  clearAnswerUI();
   setMode();
 }
 
 function nextQ(){
   const lock=$("lockSpot").checked;
   if(!lock) randomSpot();
-  randomHand();
-  $("result").textContent="";
-  $("result").className="result";
+  else{
+    randomHand();
+    return;
+  }
+  // randomSpot() already cleared + refreshed
 }
 
-// ----- chart -----
 function renderChart(){
   const spot=$("spot").value;
   const c=cfg();
@@ -394,11 +416,14 @@ function renderChart(){
 
       d.textContent = txt;
       d.title = `${hand}  R:${pct(r)} C:${pct(ca)} F:${pct(f)} (click to set practice hand)`;
+
       d.addEventListener("click", ()=>{
         $("hand").value=hand;
         $("mode").value="practice";
+        clearAnswerUI();
         setMode();
       });
+
       chart.appendChild(d);
     }
   }
@@ -422,9 +447,10 @@ function init(){
   });
   spotSel.value="RFI_BTN";
 
-  $("mode").addEventListener("change", setMode);
-  $("spot").addEventListener("change", ()=>{ setMode(); refreshPractice(); renderChart(); });
-  $("hand").addEventListener("change", refreshPractice);
+  $("mode").addEventListener("change", ()=>{ clearAnswerUI(); setMode(); });
+  $("spot").addEventListener("change", ()=>{ clearAnswerUI(); setMode(); });
+  $("hand").addEventListener("change", ()=>{ clearAnswerUI(); refreshPractice(); });
+
   $("randHand").addEventListener("click", randomHand);
   $("randSpot").addEventListener("click", randomSpot);
   $("nextQ").addEventListener("click", nextQ);
@@ -435,12 +461,15 @@ function init(){
 
   $("cellMode").addEventListener("change", renderChart);
 
+  // Any var change resets "answered" (so mix is hidden again)
   ["openSize","threeIP","threeOOP","rakePct","rakeCap","reqDisc","rIPo","rOOPo","rIP3","rOOP3","sbLimp"]
     .forEach(id=>$(id).addEventListener("input", ()=>{
+      clearAnswerUI();
       if($("mode").value==="chart") renderChart();
       refreshPractice();
     }));
 
+  clearAnswerUI();
   setMode();
   refreshPractice();
 }
